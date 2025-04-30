@@ -24,17 +24,12 @@ const Sidebar: React.FC = () => {
       <List>
         <ListItem disablePadding>
           <ListItemButton component={Link} to="/" selected={location.pathname === '/'}>
-            <ListItemText primary="Subir captura" />
-          </ListItemButton>
-        </ListItem>
-        <ListItem disablePadding>
-          <ListItemButton component={Link} to="/rules" selected={location.pathname === '/rules'}>
-            <ListItemText primary="Reglas de IP" />
+            <ListItemText primary="Traces" />
           </ListItemButton>
         </ListItem>
         <ListItem disablePadding>
           <ListItemButton component={Link} to="/subnets" selected={location.pathname === '/subnets'}>
-            <ListItemText primary="Subredes detectadas" />
+            <ListItemText primary="Subnets transformations" />
           </ListItemButton>
         </ListItem>
       </List>

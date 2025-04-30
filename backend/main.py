@@ -3,6 +3,7 @@ import asyncio
 import json
 import os           # Required for file operations (delete)
 import shutil
+import traceback # to debug
 import uuid
 from datetime import datetime
 from typing import Optional, List, Callable, Dict # Added Dict
@@ -227,12 +228,14 @@ async def delete_session(
         db_session.commit()
         print(f"Session {session_id} deleted successfully from database.")
         # For 204 No Content, we don't return a body
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
+        return None
     except Exception as e:
         db_session.rollback()
-        print(f"Database commit failed during delete for session {session_id}: {e}")
-        # If DB delete fails, the files might have already been deleted. Consider implications.
-        raise HTTPException(status_code=500, detail=f"Failed to delete session record: {e}")
+        print(f"!!! Exception caught after successful commit for session {session_id} !!!")
+        print("--- Traceback starts ---")
+        traceback.print_exc()
+        print("--- Traceback ends ---")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error after committing session deletion: {e}")
 
 
 # --- TODO: Modify other endpoints to use the database ---

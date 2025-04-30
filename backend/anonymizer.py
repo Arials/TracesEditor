@@ -17,12 +17,38 @@ from fastapi import UploadFile, HTTPException
 from fastapi.responses import FileResponse
 
 # Local imports
-from storage import store, get_rules, get_capture_path, SESSION_DIR # Ensure SESSION_DIR is defined/imported
-from models import RuleInput, Rule # Assuming Rule is needed if RuleInput is
+# Make sure these modules exist and SESSION_DIR is correctly defined/exported
+try:
+    # Ensure SESSION_DIR is correctly defined/imported, e.g. from storage or defined below
+    from storage import store, get_rules, get_capture_path, SESSION_DIR
+    from models import RuleInput, Rule
+except ImportError as e:
+    print(f"ERROR: Failed to import local modules (storage, models): {e}")
+    print("Please ensure storage.py and models.py are in the same directory or accessible")
+    # Provide default SESSION_DIR if import fails, for basic functionality
+    SESSION_DIR = './sessions'
+    print(f"WARNING: Using default SESSION_DIR: {SESSION_DIR}")
+    # Define dummy models/functions if needed, or raise the error
+    # Example dummy Rule model if models.py is missing
+    class Rule:
+        def __init__(self, source: str, target: str):
+            self.source = source
+            self.target = target
+        def model_dump(self, by_alias=False):
+            return {"source": self.source, "target": self.target}
+    class RuleInput:
+         def __init__(self, session_id: str, rules: List[Rule]):
+             self.session_id = session_id
+             self.rules = rules
+    # Define dummy storage if storage.py is missing
+    _dummy_storage = {}
+    def store(sid, key, value): _dummy_storage[f"{sid}_{key}"] = value
+    def get_rules(sid): return _dummy_storage.get(f"{sid}_rules", [])
+    def get_capture_path(sid): return os.path.join(SESSION_DIR, f"{sid}_original.pcap")
+    # raise e # Or exit, depending on desired behavior
 
 # --- Constants and Setup ---
-# SESSION_DIR should be defined, either here or imported from storage
-# SESSION_DIR = './sessions' # Example if not imported
+# Ensure SESSION_DIR exists
 os.makedirs(SESSION_DIR, exist_ok=True)
 
 # --- Global Mappings (Consider if these should be session-specific) ---
@@ -43,6 +69,7 @@ def anon_mac(mac: str) -> str:
         return f"{':'.join(oui)}:{random_tail}"
     except Exception:
         # Fallback for unexpected MAC formats
+        # Keep this warning print as it's not debug-specific
         print(f"Warning: Could not anonymize MAC '{mac}'. Using random MAC.")
         return ':'.join(f'{randint(0, 255):02X}' for _ in range(6))
 
@@ -55,7 +82,7 @@ def anon_ip(ip: str, rules: List[Rule]) -> str:
     global ip_map # Needs access to maintain uniqueness for fallback
     try:
         ip_addr = ipaddress.ip_address(ip)
-        # Check against user rules first
+        # Check against user rules first (rules should be pre-sorted by specificity)
         for rule_model in rules:
             # Use .model_dump() or .dict() if using older Pydantic
             rule = rule_model.model_dump(by_alias=False)
@@ -75,27 +102,35 @@ def anon_ip(ip: str, rules: List[Rule]) -> str:
                         new_ip_int = int(net_to.network_address) + offset
                         # Ensure the new IP is within the target network bounds
                         if new_ip_int <= int(net_to.broadcast_address):
-                             return str(ipaddress.ip_address(new_ip_int))
-                    # If offset doesn't fit or rule is otherwise unusable, continue to next rule
-                    # or eventually fall back to random IP
+                             new_ip_str = str(ipaddress.ip_address(new_ip_int))
+                             return new_ip_str # Return the successfully translated IP
+                    # If offset doesn't fit or rule is otherwise unusable
+                    # DEBUG: Temporary testing line - Print offset/rule issue
+                    print(f"DEBUG anon_ip: Offset issue or rule unusable for {ip} with rule {src_key} -> {tgt_key}.")
+                    # If the specific rule matched but offset failed, break the loop to force fallback
+                    break # Exit the rule loop to force fallback below
+
             except ValueError as e:
-                print(f"Warning: Skipping invalid CIDR rule ({src_key} -> {tgt_key}): {e}")
                 continue # Skip rule if CIDRs are invalid
 
         # Fallback: random 10.x.x.x unique across the current ip_map values
-        # Be careful with potential infinite loops if 10/8 is exhausted, though unlikely
+        # Reached ONLY if the loop completes without returning a translated IP or breaking due to offset issue
         attempts = 0
         while attempts < 1000: # Limit attempts to prevent hangs
             rand_ip = f"10.{randint(0, 255)}.{randint(0, 255)}.{randint(1, 254)}"
+            # Ensure the generated random IP is not already a target value for another original IP
             if rand_ip not in ip_map.values():
-                return rand_ip
+                 return rand_ip
             attempts += 1
         # If we can't find a unique random IP after many attempts
+        # Keep this warning print
         print(f"Warning: Could not generate unique random IP for {ip} after {attempts} attempts.")
-        return f"10.255.255.{randint(1,254)}" # Last resort fallback
+        fallback_ip = f"10.255.255.{randint(1,254)}"
+        return fallback_ip
 
     except ValueError:
-        print(f"Warning: Invalid original IP address format '{ip}'. Returning as is.")
+        # DEBUG: Temporary testing line - Print invalid input IP warning
+        print(f"DEBUG anon_ip: Invalid original IP address format '{ip}'. Returning as is.")
         return ip # Return original if it's not a valid IP
 
 
@@ -109,9 +144,8 @@ async def process_upload(file: UploadFile):
     session_id = str(uuid.uuid4())
     path = get_capture_path(session_id) # Use storage function to get path
 
-    # --- Debug prints removed, added robust error handling ---
     print(f"Processing upload for new session: {session_id}")
-    print(f"Attempting to save uploaded file to: {os.path.abspath(path)}")
+    # print(f"Attempting to save uploaded file to: {os.path.abspath(path)}") # Optional print
 
     try:
         # Save the uploaded file
@@ -130,13 +164,12 @@ async def process_upload(file: UploadFile):
         results = []
         for pkt in packets:
             if Ether in pkt and IP in pkt:
-                # Ensure keys exist before accessing
                 src_ip = pkt[IP].src if hasattr(pkt[IP], 'src') else None
                 dst_ip = pkt[IP].dst if hasattr(pkt[IP], 'dst') else None
                 src_mac = pkt[Ether].src if hasattr(pkt[Ether], 'src') else None
                 dst_mac = pkt[Ether].dst if hasattr(pkt[Ether], 'dst') else None
 
-                if all([src_ip, dst_ip, src_mac, dst_mac]): # Proceed only if all parts are valid
+                if all([src_ip, dst_ip, src_mac, dst_mac]):
                     key = (src_ip, dst_ip, src_mac, dst_mac)
                     if key not in seen:
                         results.append({
@@ -147,35 +180,31 @@ async def process_upload(file: UploadFile):
                         })
                         seen.add(key)
 
-        # Initialize empty rules for this session
-        store(session_id, 'rules', [])
+        store(session_id, 'rules', []) # Initialize with empty rules
         print(f"Session {session_id} initialized successfully.")
         return {"session_id": session_id, "mappings": results}
 
     except FileNotFoundError:
-        # This shouldn't happen if the save above succeeded, but handle defensively
         print(f"ERROR: PCAP file {path} not found after saving!")
         raise HTTPException(status_code=500, detail="Failed to process upload: File disappeared after save.")
     except Exception as e_read:
-        # Handle potential errors during rdpcap or packet processing
         print(f"ERROR: Failed to read/process PCAP file {path} after saving. Error: {e_read}")
-        # Clean up the potentially corrupted saved file
+        # Clean up potentially corrupted file
         try:
-            os.remove(path)
-            print(f"Cleaned up potentially corrupted file: {path}")
-        except OSError:
-            pass # Ignore error during cleanup
+            if os.path.exists(path):
+                os.remove(path)
+                print(f"Cleaned up potentially corrupted file: {path}")
+        except OSError as rm_err:
+             print(f"Error cleaning up file {path}: {rm_err}")
         raise HTTPException(status_code=400, detail=f"Failed to process uploaded PCAP file: {e_read}. Is it a valid PCAP?")
 
 
 def save_rules(input: RuleInput):
     """Saves user-defined transformation rules."""
     try:
-        # Store rules using canonical field names (source/target)
-        # Ensure input.rules is a list of Pydantic Rule models
         if not isinstance(input.rules, list):
              raise ValueError("Invalid format for rules.")
-        # Convert Pydantic models to dicts for JSON storage
+        # Ensure rules are actually Rule model instances before dumping if necessary
         canonical = [rule.model_dump(by_alias=False) for rule in input.rules]
         store(input.session_id, 'rules', canonical)
         print(f"Rules saved for session {input.session_id}")
@@ -188,13 +217,15 @@ def save_rules(input: RuleInput):
 def generate_preview(session_id: str):
     """Generates a preview of anonymized data based on saved rules."""
     global ip_map, mac_map
-    ip_map.clear()  # Clear global maps for a fresh preview
-    mac_map.clear()
+    # Use temporary maps for preview to avoid polluting global state used by apply_anonymization
+    temp_ip_map: Dict[str, str] = {}
+    temp_mac_map: Dict[str, str] = {}
 
     try:
-        rules_data = get_rules(session_id) # Load rules as dicts
-        # Convert dicts back to Pydantic models for anon_ip consistency
+        rules_data = get_rules(session_id)
         rules_models = [Rule(**rule_data) for rule_data in rules_data]
+        # Sort rules for preview consistency (same logic as apply)
+        rules_models.sort(key=lambda rule: ipaddress.ip_network(rule.source, strict=False).prefixlen, reverse=True)
         path = get_capture_path(session_id)
         packets = rdpcap(path)
     except FileNotFoundError:
@@ -204,34 +235,49 @@ def generate_preview(session_id: str):
 
     seen = set()
     preview = []
+    # Limit preview to a reasonable number of unique flows to avoid large responses/long processing
+    preview_limit = 100
+    count = 0
     for pkt in packets:
+        if count >= preview_limit:
+            break
         if Ether in pkt and IP in pkt:
-            # Extract fields safely
             src_ip = pkt[IP].src if hasattr(pkt[IP], 'src') else None
             dst_ip = pkt[IP].dst if hasattr(pkt[IP], 'dst') else None
             src_mac = pkt[Ether].src if hasattr(pkt[Ether], 'src') else None
             dst_mac = pkt[Ether].dst if hasattr(pkt[Ether], 'dst') else None
 
             if not all([src_ip, dst_ip, src_mac, dst_mac]):
-                continue # Skip packets with missing fields
+                continue
 
             key = (src_ip, dst_ip, src_mac, dst_mac)
             if key in seen:
                 continue
             seen.add(key)
+            count += 1
 
             original = {
                 'src_ip': src_ip, 'dst_ip': dst_ip,
                 'src_mac': src_mac, 'dst_mac': dst_mac,
             }
+
+            # Call anon_ip for preview using the temporary map (Modify anon_ip if needed)
+            # NOTE: Current anon_ip uses global ip_map for fallback uniqueness check.
+            # This might slightly skew preview if many fallbacks occur, but unlikely for limited preview.
+            # A cleaner solution would make anon_ip accept the map as a parameter.
+            anon_src_ip = temp_ip_map.setdefault(src_ip, anon_ip(src_ip, rules_models))
+            anon_dst_ip = temp_ip_map.setdefault(dst_ip, anon_ip(dst_ip, rules_models))
+            anon_src_mac = temp_mac_map.setdefault(src_mac, anon_mac(src_mac))
+            anon_dst_mac = temp_mac_map.setdefault(dst_mac, anon_mac(dst_mac))
+
             anonymized = {
-                'src_ip': ip_map.setdefault(src_ip, anon_ip(src_ip, rules_models)),
-                'dst_ip': ip_map.setdefault(dst_ip, anon_ip(dst_ip, rules_models)),
-                'src_mac': mac_map.setdefault(src_mac, anon_mac(src_mac)),
-                'dst_mac': mac_map.setdefault(dst_mac, anon_mac(dst_mac)),
+                'src_ip': anon_src_ip,
+                'dst_ip': anon_dst_ip,
+                'src_mac': anon_src_mac,
+                'dst_mac': anon_dst_mac,
             }
             preview.append({'original': original, 'anonymized': anonymized})
-    print(f"Preview generated for session {session_id}")
+    print(f"Preview generated for session {session_id} (limit: {preview_limit} flows)")
     return preview
 
 
@@ -245,21 +291,25 @@ def apply_anonymization(session_id: str, progress_callback: Optional[Callable[[i
         progress_callback: An optional function to call with progress percentage (0-100).
     """
     global ip_map, mac_map
-    ip_map.clear()  # Clear global maps for a fresh anonymization run
+    ip_map.clear()
     mac_map.clear()
     print(f"Starting anonymization for session {session_id}")
 
     try:
         rules_data = get_rules(session_id) # Load rules as dicts
         rules_models = [Rule(**rule_data) for rule_data in rules_data] # Convert to models
+
+        # --- SORTING RULES BY SPECIFICITY ---
+        rules_models.sort(key=lambda rule: ipaddress.ip_network(rule.source, strict=False).prefixlen, reverse=True)
+        # -------------------------------------
+
         path = get_capture_path(session_id)
-        # Read packets - this can consume significant memory for large files
         print(f"Reading packets from {path}...")
         packets: PacketList = rdpcap(path)
         print(f"Read {len(packets)} packets.")
-    except FileNotFoundError:
-        print(f"Error in apply_anonymization: Session data or PCAP file not found for {session_id}")
-        raise # Re-raise for run_apply to catch
+    except FileNotFoundError as e:
+        print(f"Error in apply_anonymization: Session data or PCAP file not found for {session_id}. Details: {e}")
+        raise # Re-raise for caller to handle
     except Exception as e:
         print(f"Error loading data for anonymization ({session_id}): {e}")
         raise # Re-raise
@@ -267,114 +317,125 @@ def apply_anonymization(session_id: str, progress_callback: Optional[Callable[[i
     output_path = os.path.join(SESSION_DIR, f"{session_id}_anon.pcap")
     new_packets = []
     total_packets = len(packets)
-    last_reported_progress = -1 # Track last reported percentage
+    last_reported_progress = -1
 
     print(f"Processing {total_packets} packets for anonymization...")
     # Iterate through packets and apply anonymization
     for i, pkt in enumerate(packets):
-        processed_packet = pkt # Start with original
+        # Default to original packet, only change if modification is successful
+        processed_packet = pkt
+        original_src_ip = 'N/A' # Initialize for logging
+        original_dst_ip = 'N/A'
+        # These track the *final* IPs assigned to the packet layers for logging
+        anon_src_ip_final = 'N/A (Not Processed)'
+        anon_dst_ip_final = 'N/A (Not Processed)'
+
         try:
             if Ether in pkt and IP in pkt:
-                new_ether = pkt[Ether].copy() # Work on copies
-                new_ip = pkt[IP].copy()
+                # 1. Copy the ENTIRE packet first
+                processed_packet = pkt.copy() # Work on the copy
 
-                # Anonymize MACs
-                if hasattr(new_ether, 'src'):
-                    new_ether.src = mac_map.setdefault(new_ether.src, anon_mac(new_ether.src))
-                if hasattr(new_ether, 'dst'):
-                    new_ether.dst = mac_map.setdefault(new_ether.dst, anon_mac(new_ether.dst))
+                # Store original IPs from the copy BEFORE modification
+                original_src_ip = processed_packet[IP].src if hasattr(processed_packet[IP], 'src') else 'N/A'
+                original_dst_ip = processed_packet[IP].dst if hasattr(processed_packet[IP], 'dst') else 'N/A'
 
-                # Anonymize IPs
-                if hasattr(new_ip, 'src'):
-                    new_ip.src = ip_map.setdefault(new_ip.src, anon_ip(new_ip.src, rules_models))
-                if hasattr(new_ip, 'dst'):
-                    new_ip.dst = ip_map.setdefault(new_ip.dst, anon_ip(new_ip.dst, rules_models))
+                # 2. Modify MACs directly in the copy
+                if hasattr(processed_packet[Ether], 'src'):
+                    processed_packet[Ether].src = mac_map.setdefault(processed_packet[Ether].src, anon_mac(processed_packet[Ether].src))
+                if hasattr(processed_packet[Ether], 'dst'):
+                    processed_packet[Ether].dst = mac_map.setdefault(processed_packet[Ether].dst, anon_mac(processed_packet[Ether].dst))
 
-                # Reassemble the packet layers
-                processed_packet = new_ether / new_ip / new_ip.payload # Rebuild packet
+                # 3. Modify IPs directly in the copy
+                resolved_src_ip = 'N/A' # Track resolved IP
+                resolved_dst_ip = 'N/A'
 
-                # Reset checksums so Scapy recalculates them after serialization
-                # Do this on the new 'processed_packet' object
-                if IP in processed_packet:
-                    processed_packet[IP].chksum = None # IPv4 header checksum
-                if TCP in processed_packet:
-                    processed_packet[TCP].chksum = None # TCP checksum
-                if UDP in processed_packet:
-                    processed_packet[UDP].chksum = None # UDP checksum
-                if ICMP in processed_packet:
-                    processed_packet[ICMP].chksum = None # ICMP checksum
+                if hasattr(processed_packet[IP], 'src'):
+                    resolved_src_ip = ip_map.setdefault(original_src_ip, anon_ip(original_src_ip, rules_models))
+                    processed_packet[IP].src = resolved_src_ip # Modify IP layer IN THE COPIED PACKET
 
-                # Re-create packet from bytes to finalize changes and checksums
-                processed_packet = processed_packet.__class__(bytes(processed_packet))
+                if hasattr(processed_packet[IP], 'dst'):
+                    resolved_dst_ip = ip_map.setdefault(original_dst_ip, anon_ip(original_dst_ip, rules_models))
+                    processed_packet[IP].dst = resolved_dst_ip # Modify IP layer IN THE COPIED PACKET
+
+
+                # Store final IPs for logging
+                anon_src_ip_final = processed_packet[IP].src
+                anon_dst_ip_final = processed_packet[IP].dst
+
+                # 4. Delete checksums in the modified copy
+                del processed_packet[IP].chksum
+                if TCP in processed_packet: del processed_packet[TCP].chksum
+                if UDP in processed_packet: del processed_packet[UDP].chksum
+                if ICMP in processed_packet: del processed_packet[ICMP].chksum
+
+                # 5. NO reassembly needed, NO rebuild from bytes needed
+                # processed_packet = new_ether / new_ip / new_ip.payload  <- REMOVED
+                # processed_packet = processed_packet.__class__(bytes(processed_packet)) <- REMAINS COMMENTED
+
+            # If original packet didn't have Ether/IP, processed_packet remains the original pkt copy
+            # Update final IPs for logging in this case too
+            else:
+                 if IP in processed_packet:
+                      anon_src_ip_final = processed_packet[IP].src
+                      anon_dst_ip_final = processed_packet[IP].dst
+                 else:
+                      anon_src_ip_final = 'N/A (No IP)'
+                      anon_dst_ip_final = 'N/A (No IP)'
+
+            # Append the processed packet (which is the modified copy or original if no Ether/IP)
+            new_packets.append(processed_packet)
 
         except Exception as packet_err:
-            # Log error for specific packet but continue processing others
+             # Keep this warning print
              print(f"Warning: Error processing packet {i+1}/{total_packets} in session {session_id}: {packet_err}. Appending original.")
-             processed_packet = pkt # Append original if processing failed
-
-
-        new_packets.append(processed_packet)
+             # Append the ORIGINAL packet if an error occurred during processing
+             new_packets.append(pkt) # Use pkt (original) not processed_packet here
 
         # --- Progress Reporting Logic ---
         if progress_callback and total_packets > 0:
-            # Calculate progress (0-100)
             current_progress = int(((i + 1) / total_packets) * 100)
-            # Call callback only if the integer percentage has changed
-            if current_progress > last_reported_progress:
+            # Report only on change or every few percent to avoid spamming logs/callbacks
+            if current_progress > last_reported_progress and (current_progress % 5 == 0 or current_progress == 100):
                 try:
                     progress_callback(current_progress)
                     last_reported_progress = current_progress
                 except Exception as cb_err:
-                    # Log if the callback itself fails, but don't stop anonymization
                     print(f"Warning: Progress callback failed during anonymization: {cb_err}")
 
-    # Write the anonymized packets to the output file
     try:
         print(f"Writing {len(new_packets)} processed packets to {output_path}...")
         wrpcap(output_path, new_packets)
         print(f"Successfully wrote anonymized file: {output_path}")
     except Exception as e:
         print(f"Error writing anonymized pcap file {output_path}: {e}")
-        raise # Re-raise for run_apply to catch
+        raise
 
-    return output_path # Return the path to the anonymized file
+    return output_path
 
 
 # --- Backward Compatibility / Download Helper ---
-# This function calls the modified apply_anonymization.
-# If called directly (e.g., by /download endpoint), progress is not reported.
 def apply_anonymization_response(session_id: str):
     """
     Generates the anonymized PCAP and returns a FastAPI FileResponse.
-    If the anonymized file already exists, it serves it directly.
-    If not, it calls apply_anonymization (without progress reporting) to create it.
+    (Assumes this is called by a route that does not need progress)
     """
-    output_path = os.path.join(SESSION_DIR, f"{session_id}_anon.pcap")
-
-    # Check if file already exists (e.g., created by background task)
-    if not os.path.exists(output_path):
-        print(f"Anonymized file {output_path} not found. Generating on demand...")
-        try:
-            # Call apply_anonymization without a callback to generate it
-            # This might take time and won't report progress to *this* caller.
-            apply_anonymization(session_id, progress_callback=None)
-            print(f"On-demand generation complete for {output_path}")
-        except Exception as e:
-            # Catch errors during on-demand generation
-            print(f"Error during on-demand generation for {session_id}: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to generate anonymized file: {e}")
-
-    # Serve the (now existing) file
-    if os.path.exists(output_path):
-         return FileResponse(
+    try:
+        # Call apply_anonymization without a progress callback
+        output_path = apply_anonymization(session_id, progress_callback=None)
+        print(f"Anonymization complete for response: {output_path}")
+        # Serve the generated file
+        return FileResponse(
              output_path,
              media_type='application/vnd.tcpdump.pcap',
-             filename=os.path.basename(output_path) # Suggest filename to browser
+             filename=os.path.basename(output_path) # Suggest a filename for download
          )
-    else:
-         # Should not happen if generation succeeded, but handle defensively
-         print(f"ERROR: File {output_path} still not found after generation attempt.")
-         raise HTTPException(status_code=500, detail="Failed to serve anonymized file after generation.")
+    except FileNotFoundError:
+        # If the session or original pcap was missing
+        raise HTTPException(status_code=404, detail="Session data or original PCAP file not found.")
+    except Exception as e:
+        # Catch other errors during anonymization or file serving
+        print(f"Error during final anonymization for download ({session_id}): {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate or serve anonymized file: {e}")
 
 
 def get_subnets(session_id: str):
@@ -407,10 +468,93 @@ def get_subnets(session_id: str):
         except ValueError:
             # Count invalid IP formats encountered
             invalid_ips_count += 1
+            # Keep this warning print
             print(f"Warning: Invalid IP format encountered in get_subnets: {ip_str}")
 
     if invalid_ips_count > 0:
+        # Keep this warning print
         print(f"Warning: Skipped {invalid_ips_count} invalid IP addresses in get_subnets for session {session_id}.")
 
-    # Format results for the frontend
-    return [{"cidr": cidr, "ip_count": count} for cidr, count in subnets.items()]
+    # Sort subnets by CIDR string for consistent output
+    sorted_subnets = sorted(subnets.items())
+    return [{"cidr": cidr, "ip_count": count} for cidr, count in sorted_subnets]
+
+
+# --- Example Usage (if run directly, requires dummy data/setup) ---
+if __name__ == '__main__':
+    # This block is for basic testing if the script is run directly.
+    # It won't work without setting up dummy files and models/storage.
+    print("Running anonymizer.py directly (requires dummy setup)")
+
+    # Example: Create dummy files and data for testing (replace with actual setup)
+    DUMMY_SESSION = 'test-session-main'
+    # Ensure storage module works or mock it
+    if 'SESSION_DIR' not in locals(): SESSION_DIR = './sessions_main_test'
+    os.makedirs(SESSION_DIR, exist_ok=True)
+
+    # Mock storage if not available
+    if 'store' not in locals():
+        _storage = {}
+        def store(sid, key, value): _storage[f"{sid}_{key}"] = value
+        def get_rules(sid): return _storage.get(f"{sid}_rules", [])
+        def get_capture_path(sid): return os.path.join(SESSION_DIR, f"{sid}_original.pcap")
+        print("INFO: Using mocked storage functions.")
+
+    # Mock models if not available
+    if 'Rule' not in locals():
+        from pydantic import BaseModel # Assuming Pydantic is installed
+        class Rule(BaseModel):
+             source: str
+             target: str
+        print("INFO: Using mocked Rule model.")
+
+    DUMMY_PCAP_ORIGINAL = get_capture_path(DUMMY_SESSION)
+
+    # Create a dummy pcap if it doesn't exist (requires scapy)
+    if not os.path.exists(DUMMY_PCAP_ORIGINAL):
+        print(f"Creating dummy pcap: {DUMMY_PCAP_ORIGINAL}")
+        try:
+            from scapy.all import Ether, IP, TCP, wrpcap
+            # Include IPs from the problematic subnets for testing
+            dummy_pkts = [
+                Ether(src='00:01:02:03:04:05', dst='AA:BB:CC:DD:EE:FF') / IP(src='192.168.1.1', dst='172.18.121.5') / TCP(),
+                Ether(src='00:01:02:03:04:06', dst='AA:BB:CC:DD:EE:FE') / IP(src='10.193.145.10', dst='8.8.8.8') / TCP(),
+                Ether(src='AA:BB:CC:DD:EE:FF', dst='00:01:02:03:04:05') / IP(src='172.18.121.5', dst='192.168.1.1') / TCP(),
+            ]
+            wrpcap(DUMMY_PCAP_ORIGINAL, dummy_pkts)
+            print("Dummy pcap created.")
+        except Exception as e:
+            print(f"ERROR: Failed to create dummy pcap: {e}. Install scapy[complete]?")
+
+
+    # Setup dummy rules
+    dummy_rules_list = [
+        {'source': '172.18.121.0/24', 'target': '10.3.0.0/24'},
+        {'source': '10.193.145.0/24', 'target': '10.4.0.0/24'},
+        {'source': '192.168.1.0/24', 'target': '10.99.1.0/24'},
+    ]
+    store(DUMMY_SESSION, 'rules', dummy_rules_list)
+    print(f"Stored dummy rules for session {DUMMY_SESSION}: {dummy_rules_list}")
+
+    print(f"\nAttempting to anonymize dummy file for session {DUMMY_SESSION}...")
+    try:
+        # Define a simple progress callback for testing
+        def test_progress(p):
+            print(f"Progress: {p}%")
+        # Call anonymization with the test callback
+        output_file = apply_anonymization(DUMMY_SESSION, progress_callback=test_progress)
+        print(f"Dummy anonymization finished. Output: {output_file}")
+        # Add code here to read DUMMY_PCAP_ANON and verify results if needed
+        if os.path.exists(output_file):
+            print("\nVerifying output PCAP...")
+            try:
+                anon_packets = rdpcap(output_file)
+                for i, pkt in enumerate(anon_packets):
+                    if IP in pkt:
+                        print(f"  Packet {i+1}: {pkt[IP].src} -> {pkt[IP].dst}")
+                print("Verification complete.")
+            except Exception as read_err:
+                print(f"Error reading anonymized output file: {read_err}")
+
+    except Exception as e:
+         print(f"Error during dummy anonymization test: {e}")
