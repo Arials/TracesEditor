@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+scapy[complete]
+python-magic
+pydantic
+cidr-trie
+pytest
+python-multipart
+sqlmodel

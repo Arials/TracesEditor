@@ -1,0 +1,10 @@
+{
+  "dependencies": {
+    "@mui/icons-material": "^7.0.2",
+    "file-saver": "^2.0.5",
+    "ipaddr.js": "^2.2.0"
+  },
+  "devDependencies": {
+    "@types/file-saver": "^2.0.7"
+  }
+}

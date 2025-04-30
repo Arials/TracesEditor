@@ -1,0 +1,80 @@
+# Python / General
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+# Mantenemos pcap_anonymizer.db fuera por ahora,
+# podrías querer incluir una versión inicial vacía si es necesario,
+# pero generalmente los datos generados no se suben.
+# Comenta la línea de abajo si SÍ quieres incluir el .db vacío inicial:
+pcap_anonymizer.db
+
+# FastAPI / Uvicorn specific (if any temp files)
+# (Usually covered by Python general)
+
+# Node / React / Vite
+node_modules/
+/frontend/dist/ # Asumiendo que tu frontend está en una carpeta 'frontend'
+/frontend/.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+Icon?
+ehthumbs.db
+Thumbs.db
+
+# IDE specific files (VSCode example)
+.vscode/
+
+# Session/Generated Data
+# ¡IMPORTANTE! No subir los archivos PCAP ni las reglas generadas
+sessions/
+
+# Secrets (si tuvieras archivos .env, etc.)
+# .env*
+# secrets.*
