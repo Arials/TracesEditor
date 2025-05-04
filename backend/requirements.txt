@@ -7,3 +7,4 @@ cidr-trie
 pytest
 python-multipart
 sqlmodel
+pydicom

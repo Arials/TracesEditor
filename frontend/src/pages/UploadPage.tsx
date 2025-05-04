@@ -1,32 +1,34 @@
-// File: UploadPage.tsx
-// Moved Actions column to the left in the DataGrid.
-// Added/updated English comments.
+// File: src/pages/UploadPage.tsx
+// Purpose: Allows users to upload new PCAP traces, view existing traces,
+//          edit metadata, delete traces, and select a trace for analysis
+//          in other pages (Subnets, DICOM).
+// Changes: Renamed 'handleAnalyze' to 'handleSelectSession' and removed navigation
+//          so it only sets the session ID in the context. Updated tooltip.
 
 import React, { useState, useEffect, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
-import axios from 'axios'; // For improved error handling
-import { useSession } from '../context/SessionContext'; // Verify path is correct
+import { useNavigate } from 'react-router-dom'; // Keep for potential future use, but not used in select handler now
+import axios from 'axios'; // Used for error checking
+import { useSession } from '../context/SessionContext'; // Import context hook
+
+// Import API service functions and types
 import {
     listSessions,
     uploadCapture,
-    updateSession, // Needed for edit functionality (currently placeholder)
-    deleteSession, // Needed for delete functionality
-    PcapSession, // Import main type
-    PcapSessionUpdateData // Import type for update payload
-} from '../services/api'; // Verify path is correct
+    updateSession,
+    deleteSession,
+    PcapSession, // This interface should now include is_transformed, original_session_id, async_job_id from api.ts
+    PcapSessionUpdateData
+} from '../services/api';
 
 // Material UI Imports
 import {
   Box, Typography, Button, Input, CircularProgress, Alert, TextField, LinearProgress, Divider,
-  Dialog, DialogActions, DialogContent, DialogContentText, DialogTitle, IconButton
+  Dialog, DialogActions, DialogContent, DialogContentText, DialogTitle, IconButton, Tooltip, Chip // Added Chip
 } from '@mui/material';
-// --- Ensure DataGrid and Action Icons are imported ---
-import { DataGrid, GridColDef, GridRenderCellParams } from '@mui/x-data-grid'; // Removed unused GridActionsCellItem, GridRowId
+import { DataGrid, GridColDef, GridRenderCellParams } from '@mui/x-data-grid';
 import EditIcon from '@mui/icons-material/Edit';
 import DeleteIcon from '@mui/icons-material/Delete';
-import PlayArrowIcon from '@mui/icons-material/PlayArrow';
-
-// Make sure you have installed DataGrid: npm install @mui/x-data-grid
+import CheckCircleOutlineIcon from '@mui/icons-material/CheckCircleOutline'; // Changed icon for selecting session
 
 const UploadPage: React.FC = () => {
   // --- State for Upload Form ---
@@ -35,69 +37,86 @@ const UploadPage: React.FC = () => {
   const [traceDesc, setTraceDesc] = useState('');
   const [uploadLoading, setUploadLoading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
-  const [uploadError, setUploadError] = useState(''); // For errors during/after upload attempt
-  const [fileTypeError, setFileTypeError] = useState(''); // Specific error for wrong file type
+  const [uploadError, setUploadError] = useState('');
+  const [fileTypeError, setFileTypeError] = useState('');
 
   // --- State for Trace List & Management ---
   const [traces, setTraces] = useState<PcapSession[]>([]);
   const [listLoading, setListLoading] = useState<boolean>(true);
-  const [listError, setListError] = useState<string | null>(null); // Can be used for list fetch errors or delete errors
+  const [listError, setListError] = useState<string | null>(null);
+  // Get current sessionId and the new setActiveSession function from context
+  const { sessionId, setActiveSession } = useSession();
 
   // --- State for Edit Dialog ---
   const [isEditDialogOpen, setIsEditDialogOpen] = useState<boolean>(false);
   const [editingTrace, setEditingTrace] = useState<PcapSession | null>(null);
   const [editFormData, setEditFormData] = useState<PcapSessionUpdateData>({ name: '', description: '' });
-  const [editLoading, setEditLoading] = useState<boolean>(false); // State for loading indicator during edit save
-  const [editError, setEditError] = useState<string | null>(null); // State for errors within the edit dialog
-
+  const [editLoading, setEditLoading] = useState<boolean>(false);
+  const [editError, setEditError] = useState<string | null>(null);
 
   // --- State for Delete Dialog ---
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState<boolean>(false);
   const [deletingTrace, setDeletingTrace] = useState<PcapSession | null>(null);
-  const [deleteLoading, setDeleteLoading] = useState<boolean>(false); // State for loading indicator during delete confirm
-  // Note: deleteError uses listError currently, could add a dedicated state if needed
-
+  const [deleteLoading, setDeleteLoading] = useState<boolean>(false);
 
   // --- Hooks ---
-  const navigate = useNavigate();
-  const { setSessionId } = useSession();
+  // const navigate = useNavigate(); // Keep if needed elsewhere, but not for session selection
 
+  // --- Data Fetching ---
   // --- Data Fetching ---
   const fetchTraces = useCallback(async () => {
     setListLoading(true);
-    setListError(null); // Clear previous errors when refetching
+    setListError(null);
     try {
-      const response = await listSessions();
-      // Ensure IDs are strings if needed by DataGrid
-      setTraces(response.data.map((trace: PcapSession) => ({ ...trace, id: String(trace.id) })));
-      console.log("Fetched Traces Data:", response.data);
+      const sessionsData = await listSessions(); // Get the data array directly
+
+      // --- FIX: Check if sessionsData is an array before mapping ---
+      if (Array.isArray(sessionsData)) {
+        // Map response ensuring 'id' is present and a string for DataGrid compatibility
+        setTraces(sessionsData.map((trace: PcapSession) => ({ ...trace, id: String(trace.id) })));
+        console.log("Fetched Traces Data:", sessionsData);
+      } else {
+        // Handle unexpected non-array response from API
+        console.error("Failed to fetch traces: API returned unexpected data format.", sessionsData);
+        setListError("Received invalid data format from the server. Expected an array.");
+        setTraces([]); // Reset to empty array
+      }
     } catch (err: any) {
       console.error("Failed to fetch traces:", err);
-      setListError(err.response?.data?.detail || err.message || "Failed to load trace list. Please check backend connection.");
+      // --- FIX: Improved error message handling ---
+      let errorMessage = "Failed to load trace list. Please check backend connection.";
+      if (axios.isAxiosError(err)) {
+          // Try to get specific detail from backend response, fallback to status/message
+          errorMessage = `API Error (${err.response?.status || 'Network Error'}): ${err.response?.data?.detail || err.message || 'Unknown API error'}`;
+      } else if (err instanceof Error) {
+          errorMessage = `Error: ${err.message}`;
+      }
+      setListError(errorMessage);
+      setTraces([]); // Reset to empty array on error
     } finally {
       setListLoading(false);
     }
-  }, []); // Dependency array is empty as it doesn't depend on component state/props
+  }, []); // Empty dependency array means this function is stable
 
   // Initial fetch on component mount
   useEffect(() => {
     fetchTraces();
-  }, [fetchTraces]); // fetchTraces is stable due to useCallback
+  }, [fetchTraces]); // Include fetchTraces in dependency array
 
   // --- Event Handlers ---
 
   /** Handles file selection from input and validates type */
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0] || null;
-    setUploadError(''); // Clear previous upload errors
-    setFileTypeError(''); // Clear previous file type errors
+    setUploadError('');
+    setFileTypeError('');
 
     if (selectedFile) {
         const validExtensions = ['.pcap', '.pcapng'];
         const fileExtension = selectedFile.name.substring(selectedFile.name.lastIndexOf('.')).toLowerCase();
         if (!validExtensions.includes(fileExtension)) {
             setFileTypeError(`Invalid file type (${fileExtension}). Please select a .pcap or .pcapng file.`);
-            setFile(null); // Clear invalid file selection
+            setFile(null);
             return; // Stop processing
         }
         // File type is valid
@@ -113,7 +132,6 @@ const UploadPage: React.FC = () => {
 
   /** Handles the trace file upload process */
   const handleUpload = async () => {
-    // Clear previous errors
     setUploadError('');
     setFileTypeError('');
 
@@ -122,7 +140,7 @@ const UploadPage: React.FC = () => {
       setUploadError('Please select a PCAP file first.');
       return;
     }
-    // Redundant type check (good safeguard)
+    // Basic type check (safeguard)
     const validExtensions = ['.pcap', '.pcapng'];
     const fileExtension = file.name.substring(file.name.lastIndexOf('.')).toLowerCase();
      if (!validExtensions.includes(fileExtension)) {
@@ -135,12 +153,10 @@ const UploadPage: React.FC = () => {
       return;
     }
     // Check for duplicate trace name (case-insensitive)
-    console.log('Checking for duplicate name:', `"${trimmedName.toLowerCase()}"`);
     const nameExists = traces.some(
         trace => trace.name.trim().toLowerCase() === trimmedName.toLowerCase()
     );
     if (nameExists) {
-        console.log('Duplicate name found!');
         setUploadError(`A trace with the name "${trimmedName}" already exists. Please choose a different name.`);
         return; // Stop upload
     }
@@ -157,13 +173,12 @@ const UploadPage: React.FC = () => {
         traceDesc.trim() || null, // Send null if description is empty/whitespace
         (percentCompleted) => setUploadProgress(percentCompleted) // Progress callback
       );
-
       // Success: Refresh list and clear form
       await fetchTraces();
       setTraceName('');
       setTraceDesc('');
       setFile(null);
-      // Reset file input visually by changing its key in the JSX
+      // Reset file input visually by changing its key in the JSX below
       setUploadProgress(0); // Reset progress bar
 
     } catch (err: any) {
@@ -183,30 +198,27 @@ const UploadPage: React.FC = () => {
   };
 
   // --- Edit Handlers ---
-  // --- IMPLEMENT LOGIC HERE ---
-
   /** Opens the edit dialog and pre-fills the form with the selected trace data */
   const handleEditClick = useCallback((trace: PcapSession) => {
     console.log("Edit clicked for trace:", trace);
-    setEditingTrace(trace); // Store the trace being edited
-    setEditFormData({ // Pre-fill form data
+    setEditingTrace(trace);
+    setEditFormData({
         name: trace.name,
-        description: trace.description || '' // Use empty string if description is null
+        description: trace.description || ''
     });
-    setIsEditDialogOpen(true); // Open the dialog
-    setEditError(null); // Clear any previous edit errors
-  }, []); // Depends only on set* functions, so it's stable
+    setIsEditDialogOpen(true);
+    setEditError(null);
+  }, []);
 
   /** Closes the edit dialog and resets related state */
   const handleEditDialogClose = useCallback(() => {
     setIsEditDialogOpen(false);
-    // Delay resetting state slightly to avoid seeing cleared fields during closing animation
     setTimeout(() => {
         setEditingTrace(null);
         setEditFormData({ name: '', description: '' });
         setEditError(null);
-        setEditLoading(false); // Ensure loading state is reset
-    }, 150); // Adjust timing as needed
+        setEditLoading(false);
+    }, 150);
   }, []);
 
   /** Updates the state bound to the edit form fields */
@@ -217,12 +229,13 @@ const UploadPage: React.FC = () => {
 
   /** Handles saving the edited trace data via API call */
   const handleEditSave = useCallback(async () => {
-    if (!editingTrace) return; // Should not happen if dialog is open correctly
+    if (!editingTrace) return;
 
     setEditLoading(true);
     setEditError(null);
-    const trimmedName = editFormData.name.trim();
-    const trimmedDesc = editFormData.description.trim();
+    // Safely trim, providing empty string as fallback if undefined/null (though state initializes with '')
+    const trimmedName = (editFormData.name ?? '').trim();
+    const trimmedDesc = (editFormData.description ?? '').trim();
 
     // Basic Validation
     if (!trimmedName) {
@@ -230,7 +243,6 @@ const UploadPage: React.FC = () => {
       setEditLoading(false);
       return;
     }
-
     // Duplicate Name Check (excluding the item being edited)
     const nameExists = traces.some(
       trace => trace.id !== editingTrace.id && trace.name.trim().toLowerCase() === trimmedName.toLowerCase()
@@ -241,17 +253,17 @@ const UploadPage: React.FC = () => {
       return;
     }
 
-    // Prepare data payload for API
+    // Construct update payload, sending description only if it's not empty after trimming
     const updateData: PcapSessionUpdateData = {
       name: trimmedName,
-      description: trimmedDesc || null // Send null if description is empty
+      // Assign undefined if trimmedDesc is empty, otherwise assign the trimmed string
+      description: trimmedDesc ? trimmedDesc : undefined
     };
 
     try {
-      // Call API to update the session
       await updateSession(editingTrace.id, updateData);
-      await fetchTraces(); // Refresh the list to show updated data
-      handleEditDialogClose(); // Close dialog on success
+      await fetchTraces(); // Refresh list
+      handleEditDialogClose(); // Close dialog
     } catch (err: any) {
       console.error("Failed to update trace:", err);
       let message = 'Error updating trace.';
@@ -262,28 +274,24 @@ const UploadPage: React.FC = () => {
     } finally {
       setEditLoading(false); // Ensure loading indicator stops
     }
-  }, [editingTrace, editFormData, traces, fetchTraces, handleEditDialogClose]); // Dependencies for the save handler
-
+  }, [editingTrace, editFormData, traces, fetchTraces, handleEditDialogClose]);
   // --- End of Edit Handlers ---
 
-
-  // --- Delete Handlers (Previously Implemented) ---
-
+  // --- Delete Handlers ---
   /** Opens the delete confirmation dialog */
   const handleDeleteClick = useCallback((trace: PcapSession) => {
     console.log("Attempting to delete trace:", trace);
-    setDeletingTrace(trace); // Store the trace to be deleted
-    setIsDeleteDialogOpen(true); // Open the confirmation dialog
-    setListError(null); // Clear list errors when opening dialog
+    setDeletingTrace(trace);
+    setIsDeleteDialogOpen(true);
+    setListError(null);
   }, []);
 
   /** Closes the delete confirmation dialog */
   const handleDeleteDialogClose = useCallback(() => {
     setIsDeleteDialogOpen(false);
-    // Delay reset for animation
     setTimeout(() => {
         setDeletingTrace(null);
-        setDeleteLoading(false); // Reset loading state
+        setDeleteLoading(false);
     }, 150);
   }, []);
 
@@ -292,14 +300,14 @@ const UploadPage: React.FC = () => {
     if (!deletingTrace) return;
 
     console.log("Confirming deletion for trace ID:", deletingTrace.id);
-    setDeleteLoading(true); // Start loading indicator
-    setListError(null); // Clear previous errors
+    setDeleteLoading(true);
+    setListError(null);
 
     try {
-      await deleteSession(deletingTrace.id); // Call the API service function
+      await deleteSession(deletingTrace.id);
       console.log("Trace deleted successfully:", deletingTrace.id);
-      await fetchTraces(); // Refresh the list to reflect the deletion
-      handleDeleteDialogClose(); // Close the dialog AFTER successful deletion and refresh
+      await fetchTraces(); // Refresh list
+      handleDeleteDialogClose(); // Close dialog
 
     } catch (err: any) {
       console.error("Failed to delete trace:", err);
@@ -312,77 +320,115 @@ const UploadPage: React.FC = () => {
       // Display the error (using listError state for now)
       setListError(message);
       // Keep the dialog open on error? Or close? Closing for now.
-      // Optionally: setDeleteLoading(false); // Stop loading only if dialog stays open
     } finally {
-       setDeleteLoading(false); // Ensure loading stops if error occurred but dialog closes
-       // If the dialog might stay open on error, move setDeleteLoading(false) inside catch *only*
+       setDeleteLoading(false);
     }
-  }, [deletingTrace, fetchTraces, handleDeleteDialogClose]); // Dependencies for delete confirm
-
+  }, [deletingTrace, fetchTraces, handleDeleteDialogClose]);
   // --- End of Delete Handlers ---
 
-  /** Navigates to the analysis page (/subnets) for the selected trace */
-  const handleAnalyze = useCallback((id: string) => {
-    console.log("Setting active session ID for analysis:", id);
-    setSessionId(id); // Set session ID in context
-    navigate('/subnets'); // Navigate to the subnets page route
-  }, [navigate, setSessionId]); // Dependencies
-
+  // --- MODIFIED: Function to set the active session ---
+  /** Sets the clicked trace as the active session in the global context */
+  const handleSelectSession = useCallback((trace: PcapSession) => {
+    if (!trace || !trace.id || !trace.name) {
+        console.error("handleSelectSession: Invalid trace object received", trace);
+        return;
+    }
+    console.log(`Setting active session: ID=${trace.id}, Name=${trace.name}`);
+    // Call the new context function with both id and name
+    setActiveSession({ id: trace.id, name: trace.name });
+    // No navigation here - user will use sidebar to navigate to analysis pages
+  }, [setActiveSession, traces]); // Dependency is setActiveSession and traces (to find the trace)
 
   // --- DataGrid Column Definitions ---
-  // --- MODIFIED: Moved 'actions' column to the beginning ---
+  // Moved 'actions' column to the beginning for better UX
   const columns: GridColDef<PcapSession>[] = [
-    // --- ACTION COLUMN (Now first) ---
+    // --- ACTION COLUMN ---
     {
       field: 'actions',
       headerName: 'Actions',
-      width: 150, // Adjusted width
+      width: 150,
       sortable: false,
       filterable: false,
       disableColumnMenu: true,
-      renderCell: (params: GridRenderCellParams<any, PcapSession>) => { // Ensure correct row type
+      renderCell: (params: GridRenderCellParams<any, PcapSession>) => {
         const currentTrace = params.row;
+        const isActive = currentTrace.id === sessionId; // Check if this row is the currently active session
         return (
           <Box sx={{ display: 'flex', justifyContent: 'space-evenly', width: '100%' }}>
-            <IconButton
-              aria-label="analyze"
-              size="small"
-              onClick={() => handleAnalyze(currentTrace.id)}
-              title="Analyze Trace"
-            >
-              <PlayArrowIcon fontSize="inherit" />
-            </IconButton>
-            <IconButton
-              aria-label="edit"
-              size="small"
-              onClick={() => handleEditClick(currentTrace)}
-              title="Edit Metadata"
-            >
-              <EditIcon fontSize="inherit" />
-            </IconButton>
-            <IconButton
-              aria-label="delete"
-              size="small"
-              onClick={() => handleDeleteClick(currentTrace)}
-              title="Delete Trace"
-            >
-              <DeleteIcon fontSize="inherit" />
-            </IconButton>
+            <Tooltip title={isActive ? "This is the active session" : "Set as Active Session"}>
+              {/* Disable button if it's already the active session */}
+              <span> {/* Span needed for tooltip on disabled button */}
+                <IconButton
+                  aria-label="select session"
+                  size="small"
+                  // Pass the whole trace object to the handler
+                  onClick={() => handleSelectSession(currentTrace)}
+                  disabled={isActive} // Disable if already selected
+                  color={isActive ? "success" : "default"} // Use success color if active
+                >
+                  {/* Use CheckCircle if active, PlayArrow otherwise */}
+                  <CheckCircleOutlineIcon fontSize="inherit" />
+                </IconButton>
+              </span>
+            </Tooltip>
+            <Tooltip title="Edit Metadata">
+              <IconButton
+                aria-label="edit"
+                size="small"
+                onClick={() => handleEditClick(currentTrace)}
+              >
+                <EditIcon fontSize="inherit" />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title="Delete Trace">
+              <IconButton
+                aria-label="delete"
+                size="small"
+                onClick={() => handleDeleteClick(currentTrace)}
+              >
+                <DeleteIcon fontSize="inherit" />
+              </IconButton>
+            </Tooltip>
           </Box>
         );
       },
     },
     // --- OTHER DATA COLUMNS ---
+     {
+      field: 'type', // New column for type
+      headerName: 'Type',
+      width: 120,
+      renderCell: (params: GridRenderCellParams<any, PcapSession>) => (
+        <Chip
+          label={params.row.is_transformed ? "Transformed" : "Original"}
+          size="small"
+          color={params.row.is_transformed ? "secondary" : "primary"}
+          variant="outlined"
+        />
+      ),
+    },
     {
       field: 'name',
       headerName: 'Trace Name',
-      width: 220, // Slightly wider?
+      width: 220,
       editable: false, // Metadata editing is done via dialog
+       renderCell: (params: GridRenderCellParams<PcapSession>) => { // Use correct row model type
+          // Access value and row properties correctly
+          const name = params.value as string || ''; // Value should be the name string
+          const rowData = params.row; // Row data is PcapSession
+          return rowData.is_transformed ? (
+             <Tooltip title={`Transformed from session ID: ${rowData.original_session_id || 'N/A'}`}>
+                 <span>{name}</span>
+             </Tooltip>
+          ) : (
+             <span>{name}</span>
+         ); // Add semicolon if preferred style
+      }, // Add the missing closing parenthesis and comma here
     },
     {
       field: 'description',
       headerName: 'Description',
-      width: 280, // Slightly wider?
+      width: 280,
       sortable: false,
       editable: false,
     },
@@ -390,19 +436,18 @@ const UploadPage: React.FC = () => {
       field: 'original_filename',
       headerName: 'Original File',
       width: 220,
-      sortable: false, // Usually not needed to sort by filename
+      sortable: false,
     },
     {
       field: 'upload_timestamp',
       headerName: 'Uploaded At',
       width: 180,
       type: 'dateTime',
-      // Use valueGetter to ensure Date object is passed to the renderer
+      // Ensure Date object is used for sorting/filtering/rendering
       valueGetter: (value: string | null | undefined) => value ? new Date(value) : null,
-      // Optional: Define rendering format if needed (default is usually locale-specific)
-      // valueFormatter: (value: Date | null) => value ? value.toLocaleString() : '',
+      // Use default locale string formatting
+      valueFormatter: (value: Date | null) => value ? value.toLocaleString() : '',
     },
-    // --- OLD ACTION COLUMN POSITION (Removed from here) ---
   ];
 
   // --- Rendered JSX ---
@@ -412,7 +457,7 @@ const UploadPage: React.FC = () => {
       {/* === Upload Section === */}
       <Typography variant="h5" gutterBottom component="h1">Upload New PCAP Trace</Typography>
       <Box component="form" noValidate autoComplete="off" sx={{ mb: 4, p: 2, border: '1px solid #ccc', borderRadius: 1 }}>
-        {/* Trace Name Input */}
+         {/* Trace Name Input */}
          <TextField
             label="Trace Name"
             value={traceName}
@@ -420,7 +465,6 @@ const UploadPage: React.FC = () => {
             fullWidth
             margin="normal"
             required
-            // Show error if upload failed *because* name was empty, or if upload error is generic duplicate name
             error={(!traceName.trim() && uploadError.includes("Name is required")) || uploadError.includes("already exists")}
             helperText={uploadError.includes("already exists") ? uploadError : ((!traceName.trim() && uploadError.includes("Name is required")) ? "Name is required" : "")}
             disabled={uploadLoading}
@@ -441,13 +485,12 @@ const UploadPage: React.FC = () => {
         <Typography variant="body1" sx={{ mt:1, mb: 1 }}>Select PCAP File (.pcap, .pcapng):</Typography>
         <Input
           type="file"
-          // Use a key that changes when the file is cleared to force re-render and reset internal state
-          key={file ? `file-${file.name}-${file.lastModified}` : 'file-input-cleared'}
+          // The key prop was removed here to fix the file selection display issue
           inputProps={{ accept: '.pcap,.pcapng' }}
           onChange={handleFileChange}
           sx={{ display: 'block', mb: 2 }}
           disabled={uploadLoading}
-          error={!!fileTypeError} // Indicate error state on the input itself
+          error={!!fileTypeError}
         />
         {/* Display file type error message */}
         {fileTypeError && <Alert severity="warning" sx={{ mb: 2 }}>{fileTypeError}</Alert>}
@@ -456,10 +499,9 @@ const UploadPage: React.FC = () => {
         <Button
           variant="contained"
           color="primary"
-          // Disable upload if: no file selected, name is empty, upload/job is in progress, or file type error exists
           disabled={!file || !traceName.trim() || uploadLoading || !!fileTypeError}
           onClick={handleUpload}
-          startIcon={uploadLoading ? <CircularProgress size={20} color="inherit"/> : null} // Show spinner inside button
+          startIcon={uploadLoading ? <CircularProgress size={20} color="inherit"/> : null}
         >
           {uploadLoading ? `Uploading (${uploadProgress}%)` : 'Upload Trace'}
         </Button>
@@ -467,9 +509,9 @@ const UploadPage: React.FC = () => {
         {uploadLoading && (
           <Box sx={{ width: '100%', mt: 1 }}><LinearProgress variant="determinate" value={uploadProgress} /></Box>
         )}
-        {/* Display general upload errors (API failure, non-name related validation) */}
+        {/* Display general upload errors */}
         {uploadError && !uploadError.includes("already exists") && !uploadError.includes("Name is required") && (
-             <Alert severity="error" sx={{ mt: 2 }}>{uploadError}</Alert>
+          <Alert severity="error" sx={{ mt: 2 }}>{uploadError}</Alert>
         )}
       </Box>
 
@@ -477,23 +519,22 @@ const UploadPage: React.FC = () => {
 
       {/* === Saved Traces List Section === */}
       <Typography variant="h5" gutterBottom component="h2">Saved Traces</Typography>
-      {/* Display list fetch or delete errors here */}
+      {/* Display list fetch or delete errors */}
       {listError && !listLoading && <Alert severity="error" sx={{ mb: 2 }}>{listError}</Alert>}
       <Box sx={{ height: 500, width: '100%' }}> {/* Container for DataGrid */}
          <DataGrid
             rows={traces} // Data rows
-            columns={columns} // Column definitions (with Actions now on the left)
-            loading={listLoading} // Show loading overlay when fetching
+            columns={columns} // Column definitions
+            loading={listLoading} // Show loading overlay
             pageSizeOptions={[5, 10, 25, 50]} // Rows per page options
             initialState={{
               pagination: { paginationModel: { pageSize: 10 } }, // Default page size
               sorting: { sortModel: [{ field: 'upload_timestamp', sort: 'desc' }] }, // Default sort
             }}
-            getRowId={(row) => row.id} // Explicitly tell DataGrid how to get the row ID
-            // autoHeight={false} // Use fixed height (set on parent Box) for better performance
-            disableRowSelectionOnClick // Prevent selection when clicking cells
-            density="compact" // Reduce row padding
-            localeText={{ noRowsLabel: 'No saved traces found.' }} // Custom text for empty grid
+            getRowId={(row) => row.id} // Specify the ID field
+            disableRowSelectionOnClick // Prevent selection on cell click
+            density="compact" // Use compact spacing
+            localeText={{ noRowsLabel: 'No saved traces found.' }} // Custom empty text
           />
       </Box>
 
@@ -501,32 +542,28 @@ const UploadPage: React.FC = () => {
       <Dialog open={isEditDialogOpen} onClose={handleEditDialogClose} maxWidth="sm" fullWidth>
         <DialogTitle>Edit Trace Metadata</DialogTitle>
         <DialogContent>
-          {/* Optional: Explain what can be edited */}
-          {/* <DialogContentText sx={{ mb: 2 }}>
-            Modify the name and description for the trace: {editingTrace?.original_filename ?? ''}
-          </DialogContentText> */}
            {/* Name Field */}
            <TextField
-              autoFocus // Focus this field when dialog opens
+              autoFocus
               margin="dense"
-              id="edit-trace-name" // Add id for label association
-              name="name" // Must match key in editFormData state
+              id="edit-trace-name"
+              name="name"
               label="Trace Name"
               type="text"
               fullWidth
               variant="standard"
               value={editFormData.name}
               onChange={handleEditFormChange}
-              required // Indicate field is required
-              error={!!editError && editError.toLowerCase().includes("name")} // Show error if related to name
+              required
+              error={!!editError && editError.toLowerCase().includes("name")}
               helperText={editError && editError.toLowerCase().includes("name") ? editError : ""}
-              disabled={editLoading} // Disable while save is in progress
+              disabled={editLoading}
             />
             {/* Description Field */}
             <TextField
               margin="dense"
               id="edit-trace-description"
-              name="description" // Must match key in editFormData state
+              name="description"
               label="Description (Optional)"
               type="text"
               fullWidth
@@ -535,17 +572,16 @@ const UploadPage: React.FC = () => {
               rows={3}
               value={editFormData.description}
               onChange={handleEditFormChange}
-              disabled={editLoading} // Disable while save is in progress
+              disabled={editLoading}
             />
             {/* Display general edit errors */}
             {editError && !editError.toLowerCase().includes("name") && (
-                <Alert severity="error" sx={{ mt: 2 }}>{editError}</Alert>
+              <Alert severity="error" sx={{ mt: 2 }}>{editError}</Alert>
             )}
         </DialogContent>
         <DialogActions>
           <Button onClick={handleEditDialogClose} disabled={editLoading}>Cancel</Button>
           <Button onClick={handleEditSave} variant="contained" disabled={editLoading}>
-            {/* Show loading indicator */}
             {editLoading ? <CircularProgress size={24}/> : 'Save Changes'}
           </Button>
         </DialogActions>
@@ -554,7 +590,7 @@ const UploadPage: React.FC = () => {
       {/* === Delete Confirmation Dialog === */}
       <Dialog
         open={isDeleteDialogOpen}
-        onClose={handleDeleteDialogClose} // Close when clicking outside or pressing Esc
+        onClose={handleDeleteDialogClose}
         aria-labelledby="delete-dialog-title"
         aria-describedby="delete-dialog-description"
       >
@@ -562,20 +598,18 @@ const UploadPage: React.FC = () => {
         <DialogContent>
           <DialogContentText id="delete-dialog-description">
             Are you sure you want to delete the trace named "{deletingTrace?.name || 'this trace'}"?
-            <br /> {/* Add line break for better readability */}
+            <br />
             This action cannot be undone.
           </DialogContentText>
-          {/* Optional: Show specific delete error *inside* the dialog */}
-          {/* {deleteError && <Alert severity="error" sx={{ mt: 2 }}>{deleteError}</Alert>} */}
         </DialogContent>
         <DialogActions>
           <Button onClick={handleDeleteDialogClose} disabled={deleteLoading}>Cancel</Button>
           <Button
             onClick={handleDeleteConfirm}
-            color="error" // Use error color for destructive action
+            color="error"
             variant="contained"
-            disabled={deleteLoading} // Disable while delete is in progress
-            autoFocus // Focus this button by default
+            disabled={deleteLoading}
+            autoFocus
           >
              {deleteLoading ? <CircularProgress size={24}/> : 'Delete'}
           </Button>

@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useSession } from '../context/SessionContext';
-import { getSubnets, saveRules, applyCapture, startJob, subscribeJobEvents } from '../services/api.ts';
+// Updated imports: Removed applyCapture, startJob. Added startTransformationJob, JobListResponse.
+import { getSubnets, saveRules, startTransformationJob, subscribeJobEvents, JobStatus, JobListResponse } from '../services/api';
 import {
   Box,
   Typography,
@@ -19,127 +20,35 @@ import SaveAltIcon from '@mui/icons-material/SaveAlt';
 import FolderOpenIcon from '@mui/icons-material/FolderOpen';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import { saveAs } from 'file-saver';
-import { SubnetInfo } from '../types';
+import { AxiosResponse } from 'axios'; // Import AxiosResponse here
 
-/* ----------------------------------------------------------
-   UTILS
----------------------------------------------------------- */
+// import { SubnetInfo } from '../types'; // Removed incorrect import
 
-
-/** Node of the grouping tree */
-export interface TreeNode {
+// --- Local Type Definitions (based on api.ts or expected structure) ---
+interface SubnetInfo {
   cidr: string;
   ip_count: number;
-  children?: (TreeNode | SubnetInfo)[];
 }
 
-/* ----------------------------------------------------------
-   AGRUPACIÓN JERÁRQUICA
----------------------------------------------------------- */
+// REMOVED: Local JobStatus interface (conflicts with imported one)
 
-/**
- * Convert the flat SubnetInfo list into a tree:
- * - Drop prefixes that start with 0.*
- * - Group from /32 upwards to /8; collapse a node
- *   if it only contains 1 child.
- * - A /8 is kept only if it aggregates at least 2 different children.
- */
-const buildHierarchy = (list: SubnetInfo[]): TreeNode[] => {
-  const valid = list.filter(s => !s.cidr.startsWith('0.'));
-  const parentOf = (cidr: string): string | null => {
-    const [ip, mStr] = cidr.split('/');
-    const m = Number(mStr);
-    if (m <= 8) return null;
-    const ipNum = ip.split('.').reduce((a, b) => (a << 8) + Number(b), 0);
-    const parentMask = m - 1;
-    const parentBase = (ipNum >>> (32 - parentMask)) << (32 - parentMask);
-    const bytes = [24, 16, 8, 0].map(shift => (parentBase >>> shift) & 0xff);
-    return `${bytes.join('.')}/${parentMask}`;
-  };
-
-  /* auxiliary maps */
-  const kids = new Map<string, (TreeNode | SubnetInfo)[]>();
-  const counts = new Map<string, number>();
-
-  valid.forEach(s => {
-    kids.set(s.cidr, []);
-    counts.set(s.cidr, s.ip_count);
-  });
-
-  /* climb the hierarchy */
-  const ascend = (cidr: string) => {
-    const p = parentOf(cidr);
-    if (!p) return;
-    if (!kids.has(p)) kids.set(p, []);
-    if (!kids.get(p)!.includes(cidr as any)) kids.get(p)!.push(cidr as any);
-    counts.set(p, (counts.get(p) || 0) + (counts.get(cidr) || 0));
-    ascend(p);
-  };
-  valid.forEach(s => ascend(s.cidr));
-
-  /* build node; collapse if only 1 child */
-  const make = (cidr: string): TreeNode | SubnetInfo => {
-    const ch = kids.get(cidr) || [];
-    const built = ch.map(c => make(c as string));
-    if (built.length <= 1) return built[0] || valid.find(v => v.cidr === cidr)!;
-    return { cidr, ip_count: counts.get(cidr)!, children: built };
-  };
-
-  /* remove /8 with a single child */
-  kids.forEach((v, k) => {
-    if (k.endsWith('/8') && v.length === 1) {
-      const only = v[0] as any as string;
-      kids.set(only, kids.get(only) || []);
-      counts.set(only, counts.get(only)!);
-      kids.delete(k);
-      counts.delete(k);
-    }
-  });
-
-  const roots: string[] = [];
-  kids.forEach((_v, k) => {
-    if (k.endsWith('/8')) {
-      if ((kids.get(k) || []).length >= 2) roots.push(k);
-    } else {
-      const p = parentOf(k);
-      if (!p || !kids.has(p)) roots.push(k);
-    }
-  });
-
-  return roots.map(r => make(r) as TreeNode);
-};
-
-/* ----------------------------------------------------------
-   HELPERS FOR DATAGRID
----------------------------------------------------------- */
-
-interface FlatRow {
-  id: string;          // required by DataGrid
-  cidr: string;
-  ip_count: number;
-  depth: number;
+// --- DataGrid Row Type ---
+// We just need the original SubnetInfo plus an 'id' for the DataGrid
+interface SubnetRow extends SubnetInfo {
+  id: string;
 }
 
-/** Flatten TreeNode / SubnetInfo into rows, keeping `depth` for visual indent */
-const flatten = (nodes: (TreeNode | SubnetInfo)[], depth = 0): FlatRow[] =>
-  nodes.flatMap(n => {
-    const base: FlatRow = {
-      id: (n as any).cidr,
-      cidr: (n as any).cidr, // no indent, just the CIDR string
-      ip_count: (n as any).ip_count,
-      depth,
-    };
-    const ch = (n as TreeNode).children;
-    return ch ? [base, ...flatten(ch, depth + 1)] : [base];
-  });
 
 /* ----------------------------------------------------------
    MAIN PAGE
 ---------------------------------------------------------- */
+// Removed buildHierarchy, flatten, TreeNode, FlatRow
 
 const SubnetsPage: React.FC = () => {
-  const [searchParams] = useSearchParams();
-  const { sessionId, setSessionId } = useSession();
+  // Removed searchParams as it's no longer used for session ID fallback
+  // const [searchParams] = useSearchParams();
+  // Get sessionId, sessionName (though not used here), and setActiveSession from context
+  const { sessionId, setActiveSession } = useSession();
 
   const [subnets, setSubnets] = useState<SubnetInfo[]>([]);
   const [transforms, setTransforms] = useState<Record<string, string>>({});
@@ -147,31 +56,40 @@ const SubnetsPage: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [applying, setApplying] = useState(false);
-  const [status, setStatus] = useState<{ ok: boolean; msg: string; dl?: () => void } | null>(null);
+  // Update status state to potentially hold job details for SSE resume
+  const [status, setStatus] = useState<{ ok: boolean; msg: string; jobId?: number; dl?: () => void } | null>(null);
   const [progress, setProgress] = useState<number>(0);
+  const [currentJobId, setCurrentJobId] = useState<number | null>(null); // Store current job ID
 
-  const [groupSubnets, setGroupSubnets] = useState<boolean>(false);
-  const [maskMac, setMaskMac] = useState<boolean>(false); // placeholder for future use
+  // Removed groupSubnets state
+  const [maskMac, setMaskMac] = useState<boolean>(true); // Default to true
 
-  // fallback sessionId from query string
-  useEffect(() => {
-    const p = searchParams.get('session_id');
-    if (!sessionId && p) setSessionId(p);
-  }, [searchParams, sessionId]);
+  // REMOVED: Fallback logic for setting sessionId from query string
+  // useEffect(() => {
+  //   const p = searchParams.get('session_id');
+  //   // This logic is removed because we need both ID and Name for setActiveSession,
+  //   // and the query parameter only provides the ID. The intended workflow
+  //   // is to select the session via the UploadPage.
+  //   // if (!sessionId && p) setActiveSession({ id: p, name: 'Unknown - From URL' }); // Example if we kept it
+  // }, [searchParams, sessionId, setActiveSession]);
 
   /* fetch subnets */
   useEffect(() => {
     if (!sessionId) return;
     setLoading(true);
     getSubnets(sessionId)
-      .then(res => {
-        setSubnets(res.data);
+      // Correct type: getSubnets likely returns Promise<SubnetInfo[]> directly
+      .then((data: SubnetInfo[]) => {
+        // Ensure data is an array before setting state
+        const validSubnets = Array.isArray(data) ? data : [];
+        setSubnets(validSubnets);
         /* Prepare sequential transformations 10.0.0.0/8 → 10.1.0.0/8 … */
         const t: Record<string, string> = {};
 
         // 1️⃣ group by /8
         const roots8 = new Map<string, SubnetInfo[]>();
-        res.data.forEach(s => {
+        // Add explicit type for s
+        validSubnets.forEach((s: SubnetInfo) => {
           const [a] = s.cidr.split('.');
           roots8.set(a, [...(roots8.get(a) || []), s]);
         });
@@ -184,7 +102,8 @@ const SubnetsPage: React.FC = () => {
 
           // 2️⃣ group by /16 inside the root
           const by16 = new Map<string, SubnetInfo[]>();
-          list8.forEach(s => {
+          // Use list8 here, which is derived from validSubnets
+          list8.forEach((s: SubnetInfo) => { // Type annotation already added, ensure correct variable 'list8' is used
             const [a, b] = s.cidr.split('.');
             by16.set(b, [...(by16.get(b) || []), s]);
           });
@@ -199,7 +118,7 @@ const SubnetsPage: React.FC = () => {
 
             // 3️⃣ leaves
             let nextFourth = 0;
-            list16.forEach(s => {
+            list16.forEach((s: SubnetInfo) => { // Add explicit type for s
               const [, maskStr] = s.cidr.split('/');
               const prefix = Number(maskStr);
               const cidr = `10.${secondOctet}.${thirdOctet}.${nextFourth}.0/${prefix}`.replace('.0.0/', '.0/');
@@ -215,51 +134,106 @@ const SubnetsPage: React.FC = () => {
       .finally(() => setLoading(false));
   }, [sessionId]);
 
-  // Resume job on page reload
-  useEffect(() => {
-    const jobId = localStorage.getItem('pcapJobId');
-    if (jobId && sessionId) {
-      const es = subscribeJobEvents(
-        jobId,
-        (data: any) => {
-          if (data.status === 'pending' || data.status === 'running') {
-            setProgress(data.progress ?? 0);
-            setStatus({ ok: false, msg: `Progress: ${data.progress ?? 0}%` });
-            setApplying(true);
-          } else if (data.status === 'completed') {
-            setStatus({
-              ok: true,
-              msg: 'PCAP ready! Click to download.',
-              dl: () => applyCapture(sessionId),
-            });
-            setApplying(false);
-            es.close();
-          } else if (data.status === 'failed') {
-            setStatus({ ok: false, msg: `Job failed: ${data.error}` });
-            setApplying(false);
-            es.close();
-          }
-        },
-        (err) => {
-          console.error('SSE error', err);
-          es.close();
-        }
-      );
-      return () => es.close();
+  // --- Callback Handlers for SSE ---
+  // Explicitly type the callbacks to match the expected signature
+  const handleJobUpdate: (data: JobStatus) => void = (data) => {
+    if (data.status === 'pending' || data.status === 'running') {
+      setProgress(data.progress); // Use progress directly
+      setStatus({ ok: false, msg: `Progress: ${data.progress}%`, jobId: data.id });
+      setApplying(true); // Keep applying true while running/pending
+    } else if (data.status === 'completed') {
+      // Transformation job completion is handled by the new session appearing in UploadPage.
+      // We just need to update the status message and stop the 'applying' state.
+      setStatus({
+        ok: true,
+        msg: 'Transformation complete! Check Upload page for the new PCAP.',
+        jobId: data.id
+        // No direct download link here anymore
+      });
+      setApplying(false);
+      localStorage.removeItem('transformJobId'); // Clear stored job ID on completion
+      setCurrentJobId(null);
+    } else if (data.status === 'failed') {
+      // Use error_message from the JobStatus interface
+      setStatus({ ok: false, msg: `Job failed: ${data.error_message || 'Unknown error'}`, jobId: data.id });
+      setApplying(false);
+      // Consider closing EventSource here
     }
-  }, [sessionId]);
+  };
 
-  const displayData = React.useMemo(
-    () => (groupSubnets ? buildHierarchy(subnets) : (subnets as (TreeNode | SubnetInfo)[])),
-    [subnets, groupSubnets]
+  // Explicitly type the callbacks to match the expected signature
+  const handleJobError: (err: Event | string) => void = (err) => {
+    console.error('SSE error', err);
+    // Optionally update status or show an error message
+    // setStatus({ ok: false, msg: 'Connection error during processing.' });
+    setApplying(false); // Ensure applying is set to false on error
+    // EventSource is closed automatically in api.ts on error now
+  };
+
+
+  // Resume job on page reload - Updated for integer job ID and new status handling
+  useEffect(() => {
+    const storedJobId = localStorage.getItem('transformJobId'); // Use a specific key
+    const jobId = storedJobId ? parseInt(storedJobId, 10) : null;
+
+    if (jobId && !isNaN(jobId) && sessionId) {
+      setCurrentJobId(jobId); // Set the current job ID state
+      setApplying(true); // Assume it's applying if we have a job ID
+      setStatus({ ok: false, msg: 'Resuming previous job status...', jobId });
+
+      // Define the onMessage handler specifically for resuming with explicit type
+      const resumeOnMessage: (data: JobStatus) => void = (data) => {
+          if (data.status === 'pending' || data.status === 'running') {
+            setProgress(data.progress);
+            setStatus({ ok: false, msg: `Progress: ${data.progress}%`, jobId: data.id });
+            setApplying(true); // Keep applying true
+          } else if (data.status === 'completed') {
+             setStatus({
+               ok: true,
+               msg: 'Transformation complete! Check Upload page.',
+               jobId: data.id
+             });
+             setApplying(false);
+             localStorage.removeItem('transformJobId'); // Clear stored job ID
+             setCurrentJobId(null);
+             // Don't close es here, let return cleanup handle it
+          } else if (data.status === 'failed') {
+            setStatus({ ok: false, msg: `Job failed: ${data.error_message || 'Unknown error'}`, jobId: data.id });
+            setApplying(false);
+             // Don't close es here
+          }
+      };
+
+      // Define the onError handler specifically for resuming with explicit type
+      const resumeOnError: (err: Event | string) => void = (err) => {
+          console.error('SSE error on resume', err);
+          // Don't close es here, let return cleanup handle it
+      };
+
+      // Pass job ID as string to subscribeJobEvents
+      const es = subscribeJobEvents(jobId.toString(), resumeOnMessage, resumeOnError);
+      // Return cleanup function to close EventSource when component unmounts or dependencies change
+      return () => {
+          console.log("Closing EventSource from useEffect cleanup");
+          es.close();
+      };
+    }
+  }, [sessionId]); // Removed groupSubnets from dependency array
+
+  // Directly map subnets to rows needed by DataGrid
+  const rows = React.useMemo<SubnetRow[]>(() =>
+    subnets.map(subnet => ({
+      ...subnet,
+      id: subnet.cidr, // Use cidr as the unique ID for the row
+    })),
+    [subnets]
   );
-
-  const rows = React.useMemo<FlatRow[]>(() => flatten(displayData), [displayData]);
 
   const handleChange = (c: string, v: string) =>
     setTransforms(prev => ({ ...prev, [c]: v }));
 
-  const columns: GridColDef[] = [
+  // Update GridColDef to use SubnetRow
+  const columns: GridColDef<SubnetRow>[] = [
     {
       field: 'cidr',
       headerName: 'Subnet',
@@ -269,11 +243,7 @@ const SubnetsPage: React.FC = () => {
       flex: 0,
       resizable: false,
       sortable: true,
-      renderCell: (p: GridRenderCellParams<unknown, FlatRow>) => (
-        <Box pl={p.row.depth * 2}>
-          {p.row.cidr}
-        </Box>
-      ),
+      // Removed renderCell with depth padding
     },
     {
       field: 'ip_count',
@@ -295,7 +265,8 @@ const SubnetsPage: React.FC = () => {
       flex: 0,
       resizable: false,
       sortable: false,
-      renderCell: (p: GridRenderCellParams<unknown, FlatRow>) => (
+      // Update renderCell to use SubnetRow
+      renderCell: (p: GridRenderCellParams<any, SubnetRow>) => (
         <TextField
           size="small"
           value={transforms[p.row.cidr.trim()] || ''}
@@ -349,44 +320,32 @@ const SubnetsPage: React.FC = () => {
     }
     setSaving(false);
 
-    // Start async job
-    setStatus({ ok: false, msg: 'Job queued, waiting for progress…' });
-    let jobId: string;
+    // Start async transformation job
+    setStatus({ ok: false, msg: 'Starting transformation job…' });
+    let jobDetails: JobListResponse; // Use the new response type
     try {
-      const res = await startJob(sessionId);
-      jobId = res.data.job_id;
-      localStorage.setItem('pcapJobId', jobId);
-    } catch {
-      setStatus({ ok: false, msg: 'Failed to start job' });
+      // Call the new API function
+      jobDetails = await startTransformationJob(sessionId);
+      const newJobId = jobDetails.id; // Get the integer job ID
+      setCurrentJobId(newJobId); // Store the new job ID
+      localStorage.setItem('transformJobId', newJobId.toString()); // Store job ID for resume
+      setStatus({ ok: false, msg: 'Job queued, waiting for progress…', jobId: newJobId });
+    } catch (err: any) {
+      console.error("Failed to start transformation job:", err);
+      setStatus({ ok: false, msg: `Failed to start job: ${err?.response?.data?.detail || err.message}` });
+      setSaving(false); // Ensure saving is reset on error
       return;
     }
 
-    // Subscribe to SSE for progress
-    const es = subscribeJobEvents(
-      jobId,
-      (data: any) => {
-        if (data.status === 'pending' || data.status === 'running') {
-          setProgress(data.progress ?? 0);
-          setStatus({ ok: false, msg: `Progress: ${data.progress ?? 0}%` });
-        } else if (data.status === 'completed') {
-          setStatus({
-            ok: true,
-            msg: 'PCAP ready! Click to download.',
-            dl: () => applyCapture(sessionId),
-          });
-          es.close();
-        } else if (data.status === 'failed') {
-          setStatus({ ok: false, msg: `Job failed: ${data.error}` });
-          es.close();
-        }
-      },
-      (err) => {
-        console.error('SSE error', err);
-        es.close();
-      }
-    );
+    // Subscribe to events using the new integer job ID (converted to string)
+    const es = subscribeJobEvents(jobDetails.id.toString(), handleJobUpdate, handleJobError);
 
-    setApplying(true);
+    // Cleanup function for this specific EventSource instance if handleApply is interrupted
+    // Note: This cleanup might be tricky if the component unmounts before the job finishes.
+    // The useEffect cleanup is generally more reliable for long-running subscriptions.
+    // For simplicity, we rely on the useEffect cleanup for now.
+
+    setApplying(true); // Set applying to true immediately after starting job
   };
 
   /* ---------------------------------------------------------- */
@@ -416,15 +375,7 @@ const SubnetsPage: React.FC = () => {
         </Box>
       </Box>
       <Box display="flex" gap={4} mb={2}>
-        <FormControlLabel
-          control={
-            <Checkbox
-              checked={groupSubnets}
-              onChange={(e) => setGroupSubnets(e.target.checked)}
-            />
-          }
-          label="Group by subnet"
-        />
+        {/* Removed "Group by subnet" checkbox */}
         <FormControlLabel
           control={
             <Checkbox
@@ -439,14 +390,11 @@ const SubnetsPage: React.FC = () => {
       {status && (
         <Alert severity={status.ok ? 'success' : 'info'} sx={{ mb: 2 }}>
           {status.msg}
-          {status.dl && (
-            <Button size="small" sx={{ ml: 2 }} onClick={status.dl}>
-              Download
-            </Button>
-          )}
+          {/* Removed status.dl block entirely */}
         </Alert>
       )}
-      {progress > 0 && progress < 100 && (
+      {/* Show progress only when applying and progress is positive */}
+      {applying && progress > 0 && progress < 100 && (
         <Box sx={{ width: '100%', mb: 2 }}>
           <LinearProgress variant="determinate" value={progress} />
         </Box>
@@ -461,8 +409,8 @@ const SubnetsPage: React.FC = () => {
             rows={rows}
             columns={columns}
             style={{ height: '100%' }}
-            disableSelectionOnClick
-            disableExtendRowFullWidth        // new: avoid auto‑stretch filler column
+            disableRowSelectionOnClick // Renamed prop
+            // Removed invalid prop: disableExtendRowFullWidth
             pageSizeOptions={[25, 50, 100]}
             initialState={{
               pagination: { paginationModel: { pageSize: 25, page: 0 } },

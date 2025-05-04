@@ -1,90 +1,96 @@
+// File: src/App.tsx
+// Added Route for DicomPage
+
 import React from 'react';
 import { Routes, Route } from 'react-router-dom';
-// --- MUI Imports ---
-import { Box, Toolbar, AppBar, Typography, CssBaseline, IconButton } from '@mui/material'; // Added AppBar, Typography, CssBaseline, IconButton
-// --- Your Page/Component Imports ---
-import Sidebar from './components/Sidebar.tsx'; // Assuming you have Sidebar
-import UploadPage from './pages/UploadPage.tsx';
-import SubnetsPage from './pages/SubnetsPage.tsx';
 
+// --- MUI Imports ---
+import { Box, Toolbar, AppBar, Typography, CssBaseline } from '@mui/material'; // Removed IconButton as it wasn't used here
+
+// --- Your Page/Component Imports ---
+import Sidebar from './components/Sidebar'; // Assuming path is correct
+import UploadPage from './pages/UploadPage'; // Assuming path is correct
+import SubnetsPage from './pages/SubnetsPage'; // Assuming path is correct
+import DicomPage from './pages/DicomPage';
+import AsyncPage from './pages/AsyncPage'; // Import the new AsyncPage
 
 // --- Constants ---
-// Define sidebar width if you use it for AppBar positioning
+// Define sidebar width if you use it for AppBar positioning or main content margin
 const drawerWidth = 240; // Adjust if your sidebar width is different
 
 // --- App Component ---
 const App: React.FC = () => {
-  // Replace with the actual Hex color code from the screenshot if known
-  const NOZOMI_BLUE = '#005d80 '; // Example dark blue - REPLACE THIS
+  // Define the primary color for the AppBar
+  const NOZOMI_BLUE = '#005d80'; // Example color, adjust as needed
 
   return (
-    <Box sx={{ display: 'flex' }}>
-      {/* CssBaseline helps normalize styles */}
+    <Box sx={{ display: 'flex' }}> {/* Main container using Flexbox */}
+      {/* CssBaseline helps normalize styles across browsers */}
       <CssBaseline />
 
       {/* --- AppBar (Top Navigation Bar) --- */}
       <AppBar
-        position="fixed" // Keeps the AppBar fixed at the top
+        position="fixed" // Keep AppBar fixed at the top
         sx={{
-          // Ensure AppBar is above the sidebar if sidebar is also fixed/absolute
+          // Ensure AppBar is drawn above the Sidebar (if using z-index)
           zIndex: (theme) => theme.zIndex.drawer + 1,
-          // Apply the desired background color
-          backgroundColor: NOZOMI_BLUE, // Use the defined color
+          backgroundColor: NOZOMI_BLUE, // Apply background color
         }}
       >
         <Toolbar>
-          {/* Logo Placeholder */}
-          {/* Place your logo (e.g., nozomi-logo.svg) in the /public folder */}
+          {/* Logo */}
           <img
-            src="./img/logo-small.png" // Path relative to the public folder
+            src="./img/logo-small.png" // Path relative to the 'public' folder
             alt="Logo"
-            style={{ height: '40px', marginRight: '30px' }} // Adjust height and margin
+            style={{ height: '40px', marginRight: '30px' }} // Adjust styling
           />
-
           {/* Application Title */}
           <Typography variant="h6" noWrap component="div" sx={{ color: 'white' }}>
-            Trace Editor {/* Or your preferred application name */}
+            Trace Editor
           </Typography>
-
-          {/* Spacer to push items to the right */}
+          {/* Spacer to push subsequent items to the right */}
           <Box sx={{ flexGrow: 1 }} />
-
           {/* Powered By Text */}
           <Typography variant="body2" noWrap component="div" sx={{ color: 'white' }}>
-            Powered by Adriel Regueira
+             Powered by Adriel Regueira
           </Typography>
-
         </Toolbar>
       </AppBar>
 
-      {/* --- Sidebar (Assuming it's permanent/fixed) --- */}
-      {/* Your existing Sidebar component */}
-      {/* If your sidebar is under the AppBar, it doesn't need changes here */}
-      {/* If it's fixed to the left, the main content needs left margin */}
-      <Sidebar /> {/* You might need to adjust Sidebar styling based on AppBar */}
+      {/* --- Sidebar --- */}
+      {/* Render the Sidebar component */}
+      <Sidebar />
 
       {/* --- Main Content Area --- */}
       <Box
-        component="main"
+        component="main" // Semantic main content tag
         sx={{
-          flexGrow: 1, // Takes remaining space
-          p: 3, // Padding
-          // Ensure content starts below the fixed AppBar
-          // The empty Toolbar creates space exactly the height of the AppBar
-          mt: '64px', // Default AppBar height (adjust if needed, or use Toolbar)
-          // If using a fixed sidebar like in App.tsx V1:
-          // width: `calc(100% - ${drawerWidth}px)`, // Adjust width if sidebar is permanent
-          // ml: `${drawerWidth}px`, // Add left margin if sidebar is permanent
+          flexGrow: 1, // Allow this Box to grow and fill available space
+          p: 3, // Apply padding around the content (theme spacing unit * 3)
+          // Add top margin equal to the AppBar's height to prevent content from hiding underneath
+          mt: '64px', // Default MUI AppBar height. Use Toolbar component below for automatic height matching instead if preferred.
+          // If using a permanent drawer that doesn't overlay content, adjust margin/width:
+          // width: `calc(100% - ${drawerWidth}px)`,
+          // ml: `${drawerWidth}px`,
         }}
       >
-         {/* Removed the extra <Toolbar /> spacer here as mt: '64px' handles it */}
-         {/* Alternatively, keep <Toolbar /> and remove mt: '64px' */}
+         {/* Optional: Instead of mt: '64px', you can place an empty Toolbar here
+             which acts as a spacer matching the AppBar height automatically.
+             Choose one method or the other. */}
+         {/* <Toolbar /> */}
 
-        {/* --- Routing --- */}
+        {/* --- Routing Definitions --- */}
         <Routes>
+          {/* Route for the homepage, rendering UploadPage */}
           <Route path="/" element={<UploadPage />} />
+          {/* Route for the subnets analysis page */}
           <Route path="/subnets" element={<SubnetsPage />} />
-          {/* Add other routes as needed */}
+          <Route path="/dicom" element={<DicomPage />} />
+          {/* Add route for the new Async Jobs page */}
+          <Route path="/async" element={<AsyncPage />} />
+          {/* Add other routes here if needed */}
+          {/* Example for a 404 page (optional) */}
+          {/* <Route path="*" element={<NotFoundPage />} /> */}
         </Routes>
       </Box>
     </Box>

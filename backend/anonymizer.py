@@ -47,6 +47,11 @@ except ImportError as e:
     def get_capture_path(sid): return os.path.join(SESSION_DIR, f"{sid}_original.pcap")
     # raise e # Or exit, depending on desired behavior
 
+# --- Custom Exception for Cancellation ---
+class JobCancelledException(Exception):
+    """Custom exception to signal job cancellation."""
+    pass
+
 # --- Constants and Setup ---
 # Ensure SESSION_DIR exists
 os.makedirs(SESSION_DIR, exist_ok=True)
@@ -281,14 +286,19 @@ def generate_preview(session_id: str):
     return preview
 
 
-# --- MODIFIED apply_anonymization with progress callback ---
-def apply_anonymization(session_id: str, progress_callback: Optional[Callable[[int], None]] = None):
+# --- MODIFIED apply_anonymization with progress and cancellation callbacks ---
+def apply_anonymization(
+    session_id: str,
+    progress_callback: Optional[Callable[[int], None]] = None,
+    check_stop_requested: Optional[Callable[[], bool]] = None # Added cancellation check callback
+):
     """
     Applies anonymization rules to the PCAP file for the session.
 
     Args:
         session_id: The ID of the session.
         progress_callback: An optional function to call with progress percentage (0-100).
+        check_stop_requested: An optional function to call to check if cancellation is requested.
     """
     global ip_map, mac_map
     ip_map.clear()
@@ -322,6 +332,15 @@ def apply_anonymization(session_id: str, progress_callback: Optional[Callable[[i
     print(f"Processing {total_packets} packets for anonymization...")
     # Iterate through packets and apply anonymization
     for i, pkt in enumerate(packets):
+
+        # --- Cancellation Check ---
+        # Check roughly every 100 packets or at the start/end to avoid excessive DB calls
+        if check_stop_requested and (i % 100 == 0 or i == total_packets - 1):
+            if check_stop_requested():
+                print(f"!!! [Anonymizer] Stop requested. Aborting transformation for session {session_id} at packet {i+1}/{total_packets}.")
+                raise JobCancelledException("Stop requested by user.")
+        # ------------------------
+
         # Default to original packet, only change if modification is successful
         processed_packet = pkt
         original_src_ip = 'N/A' # Initialize for logging

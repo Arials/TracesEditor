@@ -1,8 +1,8 @@
 # File: database.py
 
 import os
-from typing import Optional, Generator # Needed for the session generator
-from sqlmodel import Field, SQLModel, create_engine, Session # Key SQLModel imports
+from typing import Optional, Generator, Dict # Needed for the session generator and JSON field
+from sqlmodel import Field, SQLModel, create_engine, Session, JSON, Column # Key SQLModel imports
 from datetime import datetime # For timestamps
 
 # --- Database File Location and URL Definition ---
@@ -21,8 +21,8 @@ DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, DATABASE_FILE)}"
 # The 'engine' is the primary interface to the database.
 # connect_args={"check_same_thread": False} is required ONLY for SQLite
 # to allow its use with FastAPI (which uses different threads per request).
-engine = create_engine(DATABASE_URL, echo=True, connect_args={"check_same_thread": False})
-# echo=True will make SQLModel print the SQL statements it executes (useful for debugging)
+engine = create_engine(DATABASE_URL, echo=False, connect_args={"check_same_thread": False})
+# echo=False will prevent SQLModel from printing every SQL statement
 
 
 # --- Table Model Definition using SQLModel ---
@@ -60,6 +60,31 @@ class PcapSession(SQLModel, table=True):
     # )
     # Simpler, more compatible alternative if DB-level onupdate isn't strictly needed:
     updated_at: Optional[datetime] = Field(default_factory=datetime.utcnow)
+
+    # --- Fields for Transformed PCAPs (Task 3) ---
+    is_transformed: bool = Field(default=False, index=True)
+    # Link back to the original session if this is a transformed one
+    original_session_id: Optional[str] = Field(default=None, foreign_key="pcapsession.id", index=True)
+    # Link to the async job that created this transformed session
+    async_job_id: Optional[int] = Field(default=None, foreign_key="asyncjob.id", index=True)
+
+
+# --- Async Job Table Model (Task 2) ---
+
+class AsyncJob(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True) # Auto-incrementing integer ID
+    session_id: str = Field(foreign_key="pcapsession.id", index=True, nullable=False) # Original session
+    job_type: str = Field(index=True, nullable=False) # e.g., 'transform', 'dicom_extract'
+    status: str = Field(default="pending", index=True, nullable=False) # 'pending', 'running', 'cancelling', 'completed', 'failed', 'cancelled'
+    stop_requested: bool = Field(default=False, nullable=False) # Flag to signal task cancellation
+    progress: int = Field(default=0)
+    # Store DICOM results as JSON. Use Column(JSON) for cross-DB compatibility.
+    result_data: Optional[Dict] = Field(default=None, sa_column=Column(JSON))
+    error_message: Optional[str] = Field(default=None)
+    # Add trace_name to store the user-friendly name associated with the session at job creation time
+    trace_name: Optional[str] = Field(default=None, description="User-provided name for the session/trace at the time of job creation")
+    created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+    updated_at: Optional[datetime] = Field(default_factory=datetime.utcnow) # Consider adding onupdate logic if needed
 
 
 # --- Function to Create the Database and Tables ---
