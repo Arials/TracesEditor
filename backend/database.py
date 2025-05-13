@@ -73,7 +73,7 @@ class PcapSession(SQLModel, table=True):
 
 class AsyncJob(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True) # Auto-incrementing integer ID
-    session_id: str = Field(foreign_key="pcapsession.id", index=True, nullable=False) # Original session
+    session_id: str = Field(foreign_key="pcapsession.id", index=True, nullable=False) # Input trace ID
     job_type: str = Field(index=True, nullable=False) # e.g., 'transform', 'dicom_extract'
     status: str = Field(default="pending", index=True, nullable=False) # 'pending', 'running', 'cancelling', 'completed', 'failed', 'cancelled'
     stop_requested: bool = Field(default=False, nullable=False) # Flag to signal task cancellation
@@ -82,7 +82,11 @@ class AsyncJob(SQLModel, table=True):
     result_data: Optional[Dict] = Field(default=None, sa_column=Column(JSON))
     error_message: Optional[str] = Field(default=None)
     # Add trace_name to store the user-friendly name associated with the session at job creation time
-    trace_name: Optional[str] = Field(default=None, description="User-provided name for the session/trace at the time of job creation")
+    trace_name: Optional[str] = Field(default=None, description="User-provided name for the input trace at job creation")
+
+    # New field for the output trace ID
+    output_trace_id: Optional[str] = Field(default=None, foreign_key="pcapsession.id", index=True, nullable=True, description="ID of the PcapSession created as output by this job")
+
     created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
     updated_at: Optional[datetime] = Field(default_factory=datetime.utcnow) # Consider adding onupdate logic if needed
 

@@ -47,22 +47,54 @@ The application uses a React frontend (built with Vite and TypeScript, styled wi
 
 ## Setup and Installation
 
-1.  **Clone the repository:**
+### 0. Prerequisites (macOS using Homebrew)
+
+These steps are for macOS users to install the necessary tools using [Homebrew](https://brew.sh/). If you are on a different OS, please refer to the official installation guides for Node.js, npm, and Python.
+
+*   **Install Homebrew (if you don't have it):**
+    Open your terminal and paste the command from the [Homebrew website](https://brew.sh/). It usually looks like this:
+    ```bash
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    ```
+    Follow the on-screen instructions.
+
+*   **Install Node.js and npm:**
+    Node.js comes with npm (Node Package Manager).
+    ```bash
+    brew install node
+    ```
+    Verify the installation:
+    ```bash
+    node -v
+    npm -v
+    ```
+
+*   **Install Python 3:**
+    macOS comes with a system Python, but it's recommended to install and use a Homebrew-managed version.
+    ```bash
+    brew install python
+    ```
+    This will typically install the latest Python 3. Verify the installation (it might be available as `python3`):
+    ```bash
+    python3 --version
+    ```
+
+### 1. Clone the repository:
     ```bash
     git clone [https://github.com/Arials/TracesEditor.git](https://github.com/Arials/TracesEditor.git)
     cd TracesEditor
     ```
 
-2.  **Backend Setup:**
+### 2. Backend Setup:
     * Navigate to the backend directory: `cd backend`
-    * Create and activate a Python virtual environment:
+    * Create and activate a Python virtual environment (using the Homebrew-installed Python 3):
         ```bash
-        python -m venv venv
+        python3 -m venv venv
         source venv/bin/activate  # On Windows use `venv\Scripts\activate`
         ```
     * Install dependencies:
         ```bash
-        pip install -r requirements.txt
+        pip3 install -r requirements.txt # Use pip3 if python3 was used for venv
         ```
     * Run the backend server:
         ```bash
@@ -70,18 +102,19 @@ The application uses a React frontend (built with Vite and TypeScript, styled wi
         ```
         *(The database `pcap_anonymizer.db` and necessary tables will be created automatically on first run in the `backend` directory).*
 
-3.  **Frontend Setup:**
+### 3. Frontend Setup:
     * Open a *new* terminal window/tab.
-    * Navigate to the frontend directory (assuming it's sibling to `backend`):
+    * Navigate to the frontend directory:
         ```bash
         # From the project root directory:
-        cd ../frontend
-        # Or adjust path as needed
+        cd frontend 
+        # (Assuming you are in the project root after cloning)
         ```
-    * Install dependencies:
+    * Install dependencies (using the Homebrew-installed npm):
         ```bash
         npm install
-        # or: yarn install
+        # or: yarn install 
+        # (if you prefer yarn and have it installed: brew install yarn)
         ```
     * Run the frontend development server:
         ```bash

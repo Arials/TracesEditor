@@ -4,19 +4,21 @@
 //          in other pages (Subnets, DICOM).
 // Changes: Renamed 'handleAnalyze' to 'handleSelectSession' and removed navigation
 //          so it only sets the session ID in the context. Updated tooltip.
+//          Refactored DataGrid columns to be dynamic like DicomPage. Added download button.
 
-import React, { useState, useEffect, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom'; // Keep for potential future use, but not used in select handler now
-import axios from 'axios'; // Used for error checking
-import { useSession } from '../context/SessionContext'; // Import context hook
+import React, { useState, useEffect, useCallback, useMemo } from 'react'; // Added useMemo
+// import { useNavigate } from 'react-router-dom'; // No longer needed here
+import axios from 'axios';
+import { useSession } from '../context/SessionContext';
 
 // Import API service functions and types
 import {
-    listSessions,
+    // listSessions, // No longer called directly here
     uploadCapture,
     updateSession,
     deleteSession,
-    PcapSession, // This interface should now include is_transformed, original_session_id, async_job_id from api.ts
+    downloadSessionFile, // Import the generic download function
+    PcapSession, // This interface now includes file_type etc.
     PcapSessionUpdateData
 } from '../services/api';
 
@@ -25,12 +27,34 @@ import {
   Box, Typography, Button, Input, CircularProgress, Alert, TextField, LinearProgress, Divider,
   Dialog, DialogActions, DialogContent, DialogContentText, DialogTitle, IconButton, Tooltip, Chip // Added Chip
 } from '@mui/material';
+// Removed incorrect GridValueGetterParams import
 import { DataGrid, GridColDef, GridRenderCellParams } from '@mui/x-data-grid';
 import EditIcon from '@mui/icons-material/Edit';
 import DeleteIcon from '@mui/icons-material/Delete';
-import CheckCircleOutlineIcon from '@mui/icons-material/CheckCircleOutline'; // Changed icon for selecting session
+import CheckCircleOutlineIcon from '@mui/icons-material/CheckCircleOutline';
+import DownloadIcon from '@mui/icons-material/Download'; // Added DownloadIcon
 
-const UploadPage: React.FC = () => {
+// Props are no longer needed as data will come from context
+// interface UploadPageProps {
+//   traces: PcapSession[];
+//   listLoading: boolean;
+//   fetchTraces: () => Promise<void>; // Function to refresh the list
+// }
+
+const UploadPage: React.FC = () => { // Removed props
+  // --- Get session data from context ---
+  const {
+    sessions, // Renamed from traces
+    isLoadingSessions, // Renamed from listLoading
+    sessionsError, // For displaying list fetching errors
+    fetchSessions, // Renamed from fetchTraces
+    activeSessionId,
+    setActiveSession,
+    // addSession, // Potentially for optimistic UI updates
+    // updateSessionInList, // Potentially for optimistic UI updates
+    // removeSession // Potentially for optimistic UI updates
+  } = useSession();
+
   // --- State for Upload Form ---
   const [file, setFile] = useState<File | null>(null);
   const [traceName, setTraceName] = useState('');
@@ -41,11 +65,9 @@ const UploadPage: React.FC = () => {
   const [fileTypeError, setFileTypeError] = useState('');
 
   // --- State for Trace List & Management ---
-  const [traces, setTraces] = useState<PcapSession[]>([]);
-  const [listLoading, setListLoading] = useState<boolean>(true);
-  const [listError, setListError] = useState<string | null>(null);
-  // Get current sessionId and the new setActiveSession function from context
-  const { sessionId, setActiveSession } = useSession();
+  // listError (now sessionsError) is handled by context. Local errors for specific actions remain.
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  // activeSessionId and setActiveSession are already destructured from useSession() above.
 
   // --- State for Edit Dialog ---
   const [isEditDialogOpen, setIsEditDialogOpen] = useState<boolean>(false);
@@ -58,54 +80,45 @@ const UploadPage: React.FC = () => {
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState<boolean>(false);
   const [deletingTrace, setDeletingTrace] = useState<PcapSession | null>(null);
   const [deleteLoading, setDeleteLoading] = useState<boolean>(false);
+  // --- State for Download ---
+  const [downloadingFileId, setDownloadingFileId] = useState<string | null>(null); // Store ID of file being downloaded
+  const [downloadError, setDownloadError] = useState<string | null>(null); // Store download errors
+
 
   // --- Hooks ---
-  // const navigate = useNavigate(); // Keep if needed elsewhere, but not for session selection
+  // const navigate = useNavigate(); // Not needed
 
   // --- Data Fetching ---
-  // --- Data Fetching ---
-  const fetchTraces = useCallback(async () => {
-    setListLoading(true);
-    setListError(null);
-    try {
-      const sessionsData = await listSessions(); // Get the data array directly
+  // fetchTraces is now passed as a prop from App.tsx
+  // The initial fetch is handled in App.tsx's useEffect
 
-      // --- FIX: Check if sessionsData is an array before mapping ---
-      if (Array.isArray(sessionsData)) {
-        // Map response ensuring 'id' is present and a string for DataGrid compatibility
-        setTraces(sessionsData.map((trace: PcapSession) => ({ ...trace, id: String(trace.id) })));
-        console.log("Fetched Traces Data:", sessionsData);
-      } else {
-        // Handle unexpected non-array response from API
-        console.error("Failed to fetch traces: API returned unexpected data format.", sessionsData);
-        setListError("Received invalid data format from the server. Expected an array.");
-        setTraces([]); // Reset to empty array
-      }
-    } catch (err: any) {
-      console.error("Failed to fetch traces:", err);
-      // --- FIX: Improved error message handling ---
-      let errorMessage = "Failed to load trace list. Please check backend connection.";
-      if (axios.isAxiosError(err)) {
-          // Try to get specific detail from backend response, fallback to status/message
-          errorMessage = `API Error (${err.response?.status || 'Network Error'}): ${err.response?.data?.detail || err.message || 'Unknown API error'}`;
-      } else if (err instanceof Error) {
-          errorMessage = `Error: ${err.message}`;
-      }
-      setListError(errorMessage);
-      setTraces([]); // Reset to empty array on error
-    } finally {
-      setListLoading(false);
-    }
-  }, []); // Empty dependency array means this function is stable
+  // Note: The localStorage listener useEffect has been removed as direct context updates
+  // (via fetchSessions called by useJobTracking callback) will handle same-tab refreshes.
+  // Cross-tab refresh still relies on localStorage being set by useJobTracking and
+  // the browser firing the 'storage' event to other tabs if UploadPage is open there.
 
-  // Initial fetch on component mount
+  // Effect to listen for localStorage changes from other tabs
   useEffect(() => {
-    fetchTraces();
-  }, [fetchTraces]); // Include fetchTraces in dependency array
+    const handleStorageChange = (event: StorageEvent) => {
+      if (event.key === 'pcapSessionsLastUpdated') {
+        // console.log('UploadPage: Detected pcapSessionsLastUpdated change (cross-tab), refreshing traces.');
+        fetchSessions(); 
+      }
+    };
+    window.addEventListener('storage', handleStorageChange);
+    return () => {
+      window.removeEventListener('storage', handleStorageChange);
+    };
+  }, [fetchSessions]); // fetchSessions from SessionContext
 
   // --- Event Handlers ---
 
-  /** Handles file selection from input and validates type */
+  /**
+   * Handles the selection of a file from the input field.
+   * Validates the file type (.pcap or .pcapng) and updates component state.
+   * If the trace name field is empty, it pre-fills it with the filename (without extension).
+   * @param e - The React change event from the file input element.
+   */
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0] || null;
     setUploadError('');
@@ -130,7 +143,12 @@ const UploadPage: React.FC = () => {
     }
   };
 
-  /** Handles the trace file upload process */
+  /**
+   * Handles the trace file upload process.
+   * Validates the selected file and trace name, then calls the API to upload the capture.
+   * Manages loading states, progress updates, and error handling for the upload.
+   * On success, it refreshes the session list and clears the form.
+   */
   const handleUpload = async () => {
     setUploadError('');
     setFileTypeError('');
@@ -153,7 +171,7 @@ const UploadPage: React.FC = () => {
       return;
     }
     // Check for duplicate trace name (case-insensitive)
-    const nameExists = traces.some(
+    const nameExists = sessions.some( // Use sessions from context
         trace => trace.name.trim().toLowerCase() === trimmedName.toLowerCase()
     );
     if (nameExists) {
@@ -174,7 +192,7 @@ const UploadPage: React.FC = () => {
         (percentCompleted) => setUploadProgress(percentCompleted) // Progress callback
       );
       // Success: Refresh list and clear form
-      await fetchTraces();
+      await fetchSessions(); // Use fetchSessions from context
       setTraceName('');
       setTraceDesc('');
       setFile(null);
@@ -183,13 +201,19 @@ const UploadPage: React.FC = () => {
 
     } catch (err: any) {
       // Handle upload errors
-      let message = 'Error uploading file.';
-      if (axios.isAxiosError(err) && err.response) {
-        message = `Upload Failed: ${err.response.data?.detail || err.message}`;
-      } else if (err instanceof Error) {
-        message = err.message;
+      let displayMessage = "An unexpected error occurred while uploading. Please try again.";
+      if (axios.isAxiosError(err)) {
+        if (err.response && err.response.data && typeof err.response.data.detail === 'string') {
+            displayMessage = `Upload Failed: ${err.response.data.detail}`;
+        } else if (err.message) {
+            displayMessage = `Upload Failed: ${err.message}`;
+        } else {
+            displayMessage = `Upload Failed: An unknown server error occurred (status ${err.response?.status || 'N/A'}).`;
+        }
+      } else if (err instanceof Error && err.message) {
+        displayMessage = err.message;
       }
-      setUploadError(message);
+      setUploadError(displayMessage);
       console.error("Upload error details:", err);
       setUploadProgress(0); // Reset progress on error
     } finally {
@@ -198,9 +222,12 @@ const UploadPage: React.FC = () => {
   };
 
   // --- Edit Handlers ---
-  /** Opens the edit dialog and pre-fills the form with the selected trace data */
+  /**
+   * Opens the edit dialog and pre-fills the form with the data of the selected trace.
+   * @param trace - The PCAP session object to be edited.
+   */
   const handleEditClick = useCallback((trace: PcapSession) => {
-    console.log("Edit clicked for trace:", trace);
+    // console.log("Edit clicked for trace:", trace);
     setEditingTrace(trace);
     setEditFormData({
         name: trace.name,
@@ -210,10 +237,12 @@ const UploadPage: React.FC = () => {
     setEditError(null);
   }, []);
 
-  /** Closes the edit dialog and resets related state */
+  /**
+   * Closes the edit dialog and resets its associated state (editingTrace, form data, errors, loading).
+   */
   const handleEditDialogClose = useCallback(() => {
     setIsEditDialogOpen(false);
-    setTimeout(() => {
+    setTimeout(() => { // Delay reset to allow dialog close animation
         setEditingTrace(null);
         setEditFormData({ name: '', description: '' });
         setEditError(null);
@@ -221,13 +250,22 @@ const UploadPage: React.FC = () => {
     }, 150);
   }, []);
 
-  /** Updates the state bound to the edit form fields */
+  /**
+   * Updates the `editFormData` state as the user types in the edit dialog form fields.
+   * @param event - The React change event from the input or textarea element.
+   */
   const handleEditFormChange = useCallback((event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
     const { name, value } = event.target;
     setEditFormData(prev => ({ ...prev, [name]: value }));
   }, []);
 
-  /** Handles saving the edited trace data via API call */
+  /**
+   * Handles saving the edited trace data.
+   * Validates the form data (name cannot be empty, checks for duplicate names),
+   * then calls the API to update the session.
+   * Manages loading states and error handling for the save operation.
+   * On success, refreshes the session list and closes the dialog.
+   */
   const handleEditSave = useCallback(async () => {
     if (!editingTrace) return;
 
@@ -244,7 +282,7 @@ const UploadPage: React.FC = () => {
       return;
     }
     // Duplicate Name Check (excluding the item being edited)
-    const nameExists = traces.some(
+    const nameExists = sessions.some( // Use sessions from context
       trace => trace.id !== editingTrace.id && trace.name.trim().toLowerCase() === trimmedName.toLowerCase()
     );
     if (nameExists) {
@@ -262,102 +300,180 @@ const UploadPage: React.FC = () => {
 
     try {
       await updateSession(editingTrace.id, updateData);
-      await fetchTraces(); // Refresh list
+      await fetchSessions(); // Use fetchSessions from context
       handleEditDialogClose(); // Close dialog
     } catch (err: any) {
       console.error("Failed to update trace:", err);
-      let message = 'Error updating trace.';
-      if (axios.isAxiosError(err) && err.response) {
-        message = `Update Failed: ${err.response.data?.detail || err.message}`;
-      } else if (err instanceof Error) { message = err.message; }
-      setEditError(message); // Show error within the dialog
+      let displayMessage = "An unexpected error occurred while saving changes. Please try again.";
+      if (axios.isAxiosError(err)) {
+        if (err.response && err.response.data && typeof err.response.data.detail === 'string') {
+            displayMessage = `Update Failed: ${err.response.data.detail}`;
+        } else if (err.message) {
+            displayMessage = `Update Failed: ${err.message}`;
+        } else {
+            displayMessage = `Update Failed: An unknown server error occurred (status ${err.response?.status || 'N/A'}).`;
+        }
+      } else if (err instanceof Error && err.message) {
+        displayMessage = err.message;
+      }
+      setEditError(displayMessage); // Show error within the dialog
     } finally {
       setEditLoading(false); // Ensure loading indicator stops
     }
-  }, [editingTrace, editFormData, traces, fetchTraces, handleEditDialogClose]);
+  }, [editingTrace, editFormData, sessions, fetchSessions, handleEditDialogClose]); // Use sessions and fetchSessions from context
   // --- End of Edit Handlers ---
 
   // --- Delete Handlers ---
-  /** Opens the delete confirmation dialog */
+  /**
+   * Opens the delete confirmation dialog for the selected trace.
+   * @param trace - The PCAP session object to be deleted.
+   */
   const handleDeleteClick = useCallback((trace: PcapSession) => {
-    console.log("Attempting to delete trace:", trace);
+    // console.log("Attempting to delete trace:", trace);
     setDeletingTrace(trace);
     setIsDeleteDialogOpen(true);
-    setListError(null);
+    setDeleteError(null); // Clear previous delete errors
+    setDownloadError(null); // Clear download errors as well, as they share some UI space
   }, []);
 
-  /** Closes the delete confirmation dialog */
+  /**
+   * Closes the delete confirmation dialog and resets its associated state.
+   */
   const handleDeleteDialogClose = useCallback(() => {
     setIsDeleteDialogOpen(false);
-    setTimeout(() => {
+    setTimeout(() => { // Delay reset for dialog animation
         setDeletingTrace(null);
         setDeleteLoading(false);
     }, 150);
   }, []);
 
-  /** Handles the actual deletion process after confirmation */
+  /**
+   * Handles the actual deletion of a trace after user confirmation.
+   * Calls the API to delete the session and manages loading/error states.
+   * On success, refreshes the session list and closes the dialog.
+   */
   const handleDeleteConfirm = useCallback(async () => {
     if (!deletingTrace) return;
 
-    console.log("Confirming deletion for trace ID:", deletingTrace.id);
+    // console.log("Confirming deletion for trace ID:", deletingTrace.id);
     setDeleteLoading(true);
-    setListError(null);
+    setDeleteError(null); // Clear local delete error
 
     try {
       await deleteSession(deletingTrace.id);
-      console.log("Trace deleted successfully:", deletingTrace.id);
-      await fetchTraces(); // Refresh list
+      // console.log("Trace deleted successfully:", deletingTrace.id);
+      await fetchSessions(); // Use fetchSessions from context
       handleDeleteDialogClose(); // Close dialog
 
     } catch (err: any) {
       console.error("Failed to delete trace:", err);
-      let message = 'Error deleting trace.';
-       if (axios.isAxiosError(err) && err.response) {
-           message = `Deletion Failed: ${err.response.data?.detail || err.message}`;
-       } else if (err instanceof Error) {
-           message = err.message;
-       }
-      // Display the error (using listError state for now)
-      setListError(message);
+      let displayMessage = "An unexpected error occurred while deleting the trace. Please try again.";
+      if (axios.isAxiosError(err)) {
+        if (err.response && err.response.data && typeof err.response.data.detail === 'string') {
+            displayMessage = `Deletion Failed: ${err.response.data.detail}`;
+        } else if (err.message) {
+            displayMessage = `Deletion Failed: ${err.message}`;
+        } else {
+            displayMessage = `Deletion Failed: An unknown server error occurred (status ${err.response?.status || 'N/A'}).`;
+        }
+      } else if (err instanceof Error && err.message) {
+        displayMessage = err.message;
+      }
+      // Display the error using the local deleteError state
+      setDeleteError(displayMessage);
       // Keep the dialog open on error? Or close? Closing for now.
     } finally {
        setDeleteLoading(false);
     }
-  }, [deletingTrace, fetchTraces, handleDeleteDialogClose]);
+  }, [deletingTrace, fetchSessions, handleDeleteDialogClose]); // Use fetchSessions from context
   // --- End of Delete Handlers ---
+
+  // --- Download Handler ---
+  /**
+   * Handles the download of a trace file (original or transformed).
+   * Determines the correct session ID and filename to use for the API call.
+   * Manages loading and error states for the download.
+   * @param trace - The PCAP session object whose file is to be downloaded.
+   */
+  const handleDownload = useCallback(async (trace: PcapSession) => {
+    if (!trace || downloadingFileId) return; // Prevent double clicks or if already downloading
+
+    // Determine the correct session ID and filename for the download API.
+    // For original files, use trace.id and trace.original_filename.
+    // For transformed files (derived traces), use trace.derived_from_session_id and trace.actual_pcap_filename.
+    // For original files, use trace.id and trace.original_filename
+    // For transformed files, use derived_from_session_id and actual_pcap_filename
+    const sessionIdToUse = trace.derived_from_session_id || trace.id;
+    const filenameToUse = trace.actual_pcap_filename || trace.original_filename || `${trace.name}.pcap`; // Fallback filename
+
+    // console.log(`Attempting download: SessionID='${sessionIdToUse}', Filename='${filenameToUse}', TraceID='${trace.id}'`);
+
+    setDownloadingFileId(trace.id); // Use the trace's unique ID for loading state
+    setDownloadError(null); // Clear previous errors
+
+    try {
+      await downloadSessionFile(sessionIdToUse, filenameToUse);
+      // Download is handled by the browser, no further action needed on success here
+    } catch (err: any) {
+      console.error("Download failed:", err);
+      // The error message might be pre-formatted by api.ts
+      setDownloadError(err.message || `Failed to download file ${filenameToUse}.`);
+    } finally {
+      setDownloadingFileId(null); // Clear loading state for this trace ID
+    }
+  }, [downloadingFileId]); // Dependency
+  // --- End of Download Handler ---
+
 
   // --- MODIFIED: Function to set the active session ---
   /** Sets the clicked trace as the active session in the global context */
   const handleSelectSession = useCallback((trace: PcapSession) => {
     if (!trace || !trace.id || !trace.name) {
-        console.error("handleSelectSession: Invalid trace object received", trace);
+        console.error("handleSelectSession: Invalid trace object received", trace); // Keep error log
         return;
     }
-    console.log(`Setting active session: ID=${trace.id}, Name=${trace.name}`);
-    // Call the new context function with both id and name
-    setActiveSession({ id: trace.id, name: trace.name });
+    // console.log(`Setting active session: ID=${trace.id}, Name=${trace.name}`);
+    // Call the context function with the full trace object
+    setActiveSession(trace);
     // No navigation here - user will use sidebar to navigate to analysis pages
-  }, [setActiveSession, traces]); // Dependency is setActiveSession and traces (to find the trace)
+  }, [setActiveSession]); // Dependency is setActiveSession
 
-  // --- DataGrid Column Definitions ---
-  // Moved 'actions' column to the beginning for better UX
-  const columns: GridColDef<PcapSession>[] = [
-    // --- ACTION COLUMN ---
-    {
-      field: 'actions',
-      headerName: 'Actions',
-      width: 150,
+  // Helper function to format header names (similar to DicomPage)
+  const formatHeaderName = (key: string): string => {
+    const spaced = key
+      .replace(/_/g, ' ')
+      .replace(/([a-z])([A-Z])/g, '$1 $2')
+      .trim();
+    return spaced
+      .split(' ')
+      .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+      .join(' ');
+  };
+
+
+  // --- DataGrid Column Definitions (Dynamic) ---
+  const columns = useMemo((): GridColDef<PcapSession>[] => {
+    // Define static columns first
+    const staticColumns: GridColDef<PcapSession>[] = [
+      // --- ACTION COLUMN ---
+      {
+        field: 'actions',
+        headerName: 'Actions',
+        width: 180, // Increased width for download button
       sortable: false,
       filterable: false,
       disableColumnMenu: true,
-      renderCell: (params: GridRenderCellParams<any, PcapSession>) => {
-        const currentTrace = params.row;
-        const isActive = currentTrace.id === sessionId; // Check if this row is the currently active session
-        return (
-          <Box sx={{ display: 'flex', justifyContent: 'space-evenly', width: '100%' }}>
-            <Tooltip title={isActive ? "This is the active session" : "Set as Active Session"}>
-              {/* Disable button if it's already the active session */}
-              <span> {/* Span needed for tooltip on disabled button */}
+        renderCell: (params: GridRenderCellParams<any, PcapSession>) => {
+          const currentTrace = params.row;
+          // Removed duplicate declaration: const currentTrace = params.row;
+          const isActive = currentTrace.id === activeSessionId; // Check if this row is the currently active session
+          // Download logic moved to onClick handler below
+
+          return (
+            <Box sx={{ display: 'flex', justifyContent: 'space-evenly', width: '100%' }}>
+              <Tooltip title={isActive ? "This is the active session" : "Set as Active Session"}>
+                {/* Disable button if it's already the active session */}
+                <span> {/* Span needed for tooltip on disabled button */}
                 <IconButton
                   aria-label="select session"
                   size="small"
@@ -367,88 +483,180 @@ const UploadPage: React.FC = () => {
                   color={isActive ? "success" : "default"} // Use success color if active
                 >
                   {/* Use CheckCircle if active, PlayArrow otherwise */}
-                  <CheckCircleOutlineIcon fontSize="inherit" />
+                    <CheckCircleOutlineIcon fontSize="inherit" />
+                  </IconButton>
+                </span>
+              </Tooltip>
+              <Tooltip title="Edit Metadata">
+                <IconButton
+                  aria-label="edit"
+                  size="small"
+                  onClick={() => handleEditClick(currentTrace)}
+                >
+                  <EditIcon fontSize="inherit" />
                 </IconButton>
-              </span>
-            </Tooltip>
-            <Tooltip title="Edit Metadata">
-              <IconButton
-                aria-label="edit"
-                size="small"
-                onClick={() => handleEditClick(currentTrace)}
-              >
-                <EditIcon fontSize="inherit" />
-              </IconButton>
-            </Tooltip>
-            <Tooltip title="Delete Trace">
-              <IconButton
-                aria-label="delete"
-                size="small"
-                onClick={() => handleDeleteClick(currentTrace)}
-              >
-                <DeleteIcon fontSize="inherit" />
-              </IconButton>
-            </Tooltip>
-          </Box>
-        );
+              </Tooltip>
+              {/* Download Button */}
+              <Tooltip title="Download Trace File">
+                {/* Span needed for tooltip on disabled button */}
+                <span>
+                  <IconButton
+                    aria-label="download"
+                    size="small"
+                    onClick={() => handleDownload(currentTrace)}
+                    disabled={downloadingFileId === currentTrace.id} // Disable while this specific file is downloading
+                  >
+                    {downloadingFileId === currentTrace.id ? <CircularProgress size={18} /> : <DownloadIcon fontSize="inherit" />}
+                  </IconButton>
+                </span>
+              </Tooltip>
+              <Tooltip title="Delete Trace">
+                <IconButton
+                  aria-label="delete"
+                  size="small"
+                  onClick={() => handleDeleteClick(currentTrace)} // Corrected handler and removed duplicate props
+                >
+                  <DeleteIcon fontSize="inherit" />
+                </IconButton>
+              </Tooltip>
+            </Box>
+          );
+        },
       },
-    },
-    // --- OTHER DATA COLUMNS ---
-     {
-      field: 'type', // New column for type
-      headerName: 'Type',
-      width: 120,
-      renderCell: (params: GridRenderCellParams<any, PcapSession>) => (
-        <Chip
-          label={params.row.is_transformed ? "Transformed" : "Original"}
-          size="small"
-          color={params.row.is_transformed ? "secondary" : "primary"}
-          variant="outlined"
-        />
-      ),
-    },
-    {
-      field: 'name',
-      headerName: 'Trace Name',
-      width: 220,
-      editable: false, // Metadata editing is done via dialog
-       renderCell: (params: GridRenderCellParams<PcapSession>) => { // Use correct row model type
-          // Access value and row properties correctly
-          const name = params.value as string || ''; // Value should be the name string
-          const rowData = params.row; // Row data is PcapSession
-          return rowData.is_transformed ? (
-             <Tooltip title={`Transformed from session ID: ${rowData.original_session_id || 'N/A'}`}>
-                 <span>{name}</span>
-             </Tooltip>
-          ) : (
-             <span>{name}</span>
-         ); // Add semicolon if preferred style
-      }, // Add the missing closing parenthesis and comma here
-    },
-    {
-      field: 'description',
-      headerName: 'Description',
-      width: 280,
-      sortable: false,
-      editable: false,
-    },
-    {
-      field: 'original_filename',
-      headerName: 'Original File',
-      width: 220,
-      sortable: false,
-    },
-    {
-      field: 'upload_timestamp',
-      headerName: 'Uploaded At',
-      width: 180,
-      type: 'dateTime',
-      // Ensure Date object is used for sorting/filtering/rendering
-      valueGetter: (value: string | null | undefined) => value ? new Date(value) : null,
-      // Use default locale string formatting
-      valueFormatter: (value: Date | null) => value ? value.toLocaleString() : '',
-    },
-  ];
+      // --- TYPE COLUMN ---
+      {
+        field: 'file_type', // Use the new field from the PcapSession interface
+        headerName: 'Type',
+        width: 180, // Increased width for longer labels
+        renderCell: (params: GridRenderCellParams<any, PcapSession>) => {
+          let label = "Original";
+          let color: "primary" | "secondary" | "info" | "warning" | "success" | "error" | "default" = "primary"; // Default color type
+          switch (params.row.file_type) {
+            case "original":
+              label = "Original Upload";
+              color = "primary";
+              break;
+            case "ip_mac_anonymized":
+              label = "IP/MAC Anonymized";
+              color = "secondary";
+              break;
+            case "mac_transformed":
+              label = "MAC Transformed";
+              color = "info"; // Use a different color
+              break;
+            case "dicom_v2_anonymized": // Add case for potential future types
+              label = "DICOM V2 Anonymized";
+              color = "success";
+              break;
+            default:
+              // Fallback based on is_transformed if file_type is missing/unexpected
+              label = params.row.is_transformed ? "Transformed (Legacy)" : "Original";
+              color = params.row.is_transformed ? "warning" : "primary";
+          }
+          return (
+            <Chip label={label} size="small" color={color} variant="outlined" />
+          );
+        },
+      },
+    ];
+
+    // Get all unique keys from the first trace object (assuming all traces have the same structure)
+    // Exclude keys already handled by static columns or internal IDs
+    const dynamicKeys = sessions.length > 0 // Use sessions from context
+      ? Object.keys(sessions[0]).filter(key =>
+          key !== 'id' && // Exclude internal ID
+          key !== 'actions' && // Exclude manually added field
+          key !== 'type' && // Exclude manually added field
+          key !== 'is_transformed' && // Handled by 'type' column
+          key !== 'original_session_id' // Used in 'name' tooltip
+        )
+      : [];
+
+    // Create GridColDef for each dynamic key
+    const dynamicColumns: GridColDef<PcapSession>[] = dynamicKeys.map(key => {
+      const headerName = formatHeaderName(key);
+      let minWidth = 150; // Default min width
+      let flex = 1; // Default flex grow
+
+      // Adjust sizing hints based on key
+      if (key.toLowerCase().includes('name')) { minWidth = 200; flex = 1.5; }
+      if (key.toLowerCase().includes('description')) { minWidth = 250; flex = 2; }
+      if (key.toLowerCase().includes('filename')) { minWidth = 200; flex = 1.5; }
+      if (key.toLowerCase().includes('timestamp')) { minWidth = 180; flex = 1; }
+
+      // Base column definition
+      let colDef: GridColDef<PcapSession> = {
+        field: key,
+        headerName: headerName,
+        minWidth: minWidth,
+        flex: flex,
+        sortable: true,
+        editable: false, // Editing is done via dialog
+        // Custom rendering logic
+        renderCell: (params: GridRenderCellParams<any, PcapSession>) => {
+          // Explicitly access the value from the row using the current key
+          const value = params.row[key as keyof PcapSession];
+          const rowData = params.row; // Keep rowData for context if needed (e.g., for 'name' tooltip)
+
+          // Specific rendering for 'name'
+          if (key === 'name') {
+            const name = value as string || '';
+            return rowData.is_transformed ? (
+              <Tooltip title={`Transformed from session ID: ${rowData.original_session_id || 'N/A'}`}>
+                <Typography variant="body2" noWrap>{name}</Typography>
+              </Tooltip>
+            ) : (
+              <Typography variant="body2" noWrap>{name}</Typography>
+            );
+          }
+
+          // Specific rendering/formatting for 'upload_timestamp'
+          if (key === 'upload_timestamp') {
+            // Ensure value is treated as string for Date constructor
+            const date = value ? new Date(value as string) : null;
+            const displayValue = date ? date.toLocaleString() : '';
+            return (
+              <Tooltip title={displayValue}>
+                <Typography variant="body2" noWrap>{displayValue}</Typography>
+              </Tooltip>
+            );
+          }
+
+          // Default rendering for other types (string, number, boolean, etc.)
+          // Ensure value is converted to string for Tooltip title and Typography children
+          const displayValue = (value === null || value === undefined) ? '' : String(value);
+          let tooltipTitle = displayValue;
+          if (typeof value === 'object' && value !== null) {
+              try {
+                  tooltipTitle = JSON.stringify(value);
+              } catch {
+                  tooltipTitle = '[Object]'; // Fallback if stringify fails
+              }
+          }
+
+          return (
+            <Tooltip title={tooltipTitle}>
+              {/* Display the simple string version in the cell */}
+              {/* Ensure Typography child is a string */}
+              <Typography variant="body2" noWrap>{displayValue}</Typography>
+            </Tooltip>
+          );
+        },
+        // Conditionally add type and valueGetter directly in the definition
+        type: key === 'upload_timestamp' ? 'dateTime' : undefined,
+        valueGetter: key === 'upload_timestamp'
+          ? (params: any) => (params?.row?.upload_timestamp ? new Date(params.row.upload_timestamp as string) : null)
+          : undefined,
+      };
+
+      return colDef;
+    });
+
+    // Combine static and dynamic columns
+    return [...staticColumns, ...dynamicColumns];
+
+  }, [sessions, activeSessionId, handleEditClick, handleDeleteClick, handleSelectSession, fetchSessions]); // Added fetchSessions to dependencies, use sessions
+
 
   // --- Rendered JSX ---
   return (
@@ -519,13 +727,17 @@ const UploadPage: React.FC = () => {
 
       {/* === Saved Traces List Section === */}
       <Typography variant="h5" gutterBottom component="h2">Saved Traces</Typography>
-      {/* Display list fetch or delete errors */}
-      {listError && !listLoading && <Alert severity="error" sx={{ mb: 2 }}>{listError}</Alert>}
+      {/* Display delete errors */}
+      {deleteError && <Alert severity="error" sx={{ mb: 2 }}>{deleteError}</Alert>}
+      {/* Display download errors */}
+      {downloadError && <Alert severity="error" sx={{ mb: 2 }}>{downloadError}</Alert>}
+      {/* Display session fetching errors from context */}
+      {sessionsError && <Alert severity="error" sx={{ mb: 2 }}>{sessionsError}</Alert>}
       <Box sx={{ height: 500, width: '100%' }}> {/* Container for DataGrid */}
          <DataGrid
-            rows={traces} // Data rows
+            rows={sessions} // Use sessions from context
             columns={columns} // Column definitions
-            loading={listLoading} // Show loading overlay
+            loading={isLoadingSessions} // Use isLoadingSessions from context
             pageSizeOptions={[5, 10, 25, 50]} // Rows per page options
             initialState={{
               pagination: { paginationModel: { pageSize: 10 } }, // Default page size

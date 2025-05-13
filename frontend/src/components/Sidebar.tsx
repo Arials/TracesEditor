@@ -16,6 +16,9 @@ import UploadFileIcon from '@mui/icons-material/UploadFile';
 import HubIcon from '@mui/icons-material/Hub';
 import DescriptionIcon from '@mui/icons-material/Description';
 import ListAltIcon from '@mui/icons-material/ListAlt'; // Icon for Async Jobs
+import EnhancedEncryptionIcon from '@mui/icons-material/EnhancedEncryption'; // Icon for DICOM V2
+import SettingsEthernetIcon from '@mui/icons-material/SettingsEthernet'; // Icon for MAC Vendor
+import SettingsIcon from '@mui/icons-material/Settings'; // Icon for Settings
 
 // Define the width of the sidebar
 const drawerWidth = 240;
@@ -37,14 +40,29 @@ const Sidebar: React.FC = () => {
       icon: <HubIcon />
     },
     {
-      text: 'DICOM Metadata',
-      path: '/dicom',
-      icon: <DescriptionIcon />
+      text: 'MAC Transformations',
+      path: '/mac',
+      icon: <SettingsEthernetIcon />
+    },
+    // {
+    //   text: 'DICOM Metadata',
+    //   path: '/dicom',
+    //   icon: <DescriptionIcon />
+    // },
+    // {
+    //   text: 'DICOM Anonymization V2',
+    //   path: '/dicom-anonymization-v2',
+    //   icon: <EnhancedEncryptionIcon />
+    // },
+    {
+      text: 'Async Jobs', // Moved to the bottom
+      path: '/async',
+      icon: <ListAltIcon />
     },
     {
-      text: 'Async Jobs', // New menu item for background jobs
-      path: '/async',     // Links to the new AsyncPage route
-      icon: <ListAltIcon />
+      text: 'Settings',
+      path: '/settings',
+      icon: <SettingsIcon />
     },
   ];
 

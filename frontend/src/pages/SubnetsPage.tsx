@@ -1,8 +1,7 @@
-import React, { useEffect, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import React, { useEffect, useState, useCallback } from 'react';
 import { useSession } from '../context/SessionContext';
-// Updated imports: Removed applyCapture, startJob. Added startTransformationJob, JobListResponse.
-import { getSubnets, saveRules, startTransformationJob, subscribeJobEvents, JobStatus, JobListResponse } from '../services/api';
+import { getSubnets, saveRules, startTransformationJob, JobStatus } from '../services/api'; // Removed getJobDetails, subscribeJobEvents, API_BASE_URL as hook handles them
+import { useJobTracking } from '../hooks/useJobTracking'; // Import the hook
 import {
   Box,
   Typography,
@@ -20,7 +19,6 @@ import SaveAltIcon from '@mui/icons-material/SaveAlt';
 import FolderOpenIcon from '@mui/icons-material/FolderOpen';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import { saveAs } from 'file-saver';
-import { AxiosResponse } from 'axios'; // Import AxiosResponse here
 
 // import { SubnetInfo } from '../types'; // Removed incorrect import
 
@@ -38,6 +36,76 @@ interface SubnetRow extends SubnetInfo {
   id: string;
 }
 
+// --- Helper Function for Transformation Generation ---
+
+/**
+ * Generates a default set of transformation rules for subnets.
+ * It maps original subnets to a new, anonymized address space,
+ * typically starting from 10.0.0.0, while trying to maintain
+ * some structural similarity by mapping /8, /16, and then
+ * individual subnets sequentially.
+ *
+ * @param validSubnets - An array of SubnetInfo objects representing the detected subnets.
+ * @returns A record where keys are original CIDRs and values are their proposed transformed CIDRs.
+ */
+function generateDefaultSubnetTransformations(validSubnets: SubnetInfo[]): Record<string, string> {
+  const t: Record<string, string> = {};
+
+  // 1️⃣ Group subnets by their original first octet (e.g., all "192.x.x.x" subnets)
+  const roots8 = new Map<string, SubnetInfo[]>();
+  validSubnets.forEach((s: SubnetInfo) => {
+    const [a] = s.cidr.split('.');
+    roots8.set(a, [...(roots8.get(a) || []), s]);
+  });
+
+  let nextTransformedSecondOctet = 0; // Counter for the second octet of the transformed 10.x.0.0/8 space
+
+  roots8.forEach((subnetsInFirstOctetGroup, originalFirstOctet) => {
+    // Create a transformation for the entire /8 block
+    const originalSuper8 = `${originalFirstOctet}.0.0.0/8`;
+    const currentTransformedSecondOctet = nextTransformedSecondOctet++;
+    t[originalSuper8] = `10.${currentTransformedSecondOctet}.0.0/8`;
+
+    // 2️⃣ Group subnets within this /8 block by their original second octet
+    const by16 = new Map<string, SubnetInfo[]>();
+    subnetsInFirstOctetGroup.forEach((s: SubnetInfo) => {
+      const [, b] = s.cidr.split('.');
+      by16.set(b, [...(by16.get(b) || []), s]);
+    });
+
+    // Map to track the next available third octet for each transformed second octet's /16 groups.
+    // Key: original second octet string, Value: next third octet to use for transformation.
+    // This is reset for each new `currentTransformedSecondOctet` implicitly by its scope.
+    let nextTransformedThirdOctetMap: Record<string, number> = {};
+
+    by16.forEach((subnetsInSecondOctetGroup, originalSecondOctetStr) => {
+      // Create a transformation for the /16 block
+      const originalSuper16 = `${originalFirstOctet}.${originalSecondOctetStr}.0.0/16`;
+      
+      // Determine the next third octet for the transformation.
+      // It's based on the currentTransformedSecondOctet and increments for each new originalSecondOctetStr.
+      const currentTransformedThirdOctet = nextTransformedThirdOctetMap[originalSecondOctetStr] ?? 0;
+      nextTransformedThirdOctetMap[originalSecondOctetStr] = currentTransformedThirdOctet + 1;
+      
+      t[originalSuper16] = `10.${currentTransformedSecondOctet}.${currentTransformedThirdOctet}.0/16`;
+
+      // 3️⃣ Process leaf subnets within this /16 block
+      let nextTransformedFourthOctet = 0; // Counter for the fourth octet within the current transformed 10.second.third.X/prefix
+      subnetsInSecondOctetGroup.forEach((s: SubnetInfo) => {
+        const [, maskStr] = s.cidr.split('/');
+        const prefix = Number(maskStr);
+        // Construct the transformed CIDR for the leaf subnet
+        // The .replace handles cases like /16 or /8 where the fourth octet might be .0.0 but should be .0
+        const transformedCidr = `10.${currentTransformedSecondOctet}.${currentTransformedThirdOctet}.${nextTransformedFourthOctet}.0/${prefix}`.replace('.0.0/', '.0/');
+        t[s.cidr] = transformedCidr;
+        nextTransformedFourthOctet++;
+      });
+    });
+  });
+
+  return t;
+}
+
 
 /* ----------------------------------------------------------
    MAIN PAGE
@@ -47,178 +115,99 @@ interface SubnetRow extends SubnetInfo {
 const SubnetsPage: React.FC = () => {
   // Removed searchParams as it's no longer used for session ID fallback
   // const [searchParams] = useSearchParams();
-  // Get sessionId, sessionName (though not used here), and setActiveSession from context
-  const { sessionId, setActiveSession } = useSession();
+  // Get the full activeSession object, sessionName (though not used here), and setActiveSession from context
+  const { activeSession, fetchSessions } = useSession(); // Get full activeSession
 
   const [subnets, setSubnets] = useState<SubnetInfo[]>([]);
   const [transforms, setTransforms] = useState<Record<string, string>>({});
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [applying, setApplying] = useState(false);
-  // Update status state to potentially hold job details for SSE resume
-  const [status, setStatus] = useState<{ ok: boolean; msg: string; jobId?: number; dl?: () => void } | null>(null);
-  const [progress, setProgress] = useState<number>(0);
-  const [currentJobId, setCurrentJobId] = useState<number | null>(null); // Store current job ID
+  const [loadingSubnets, setLoadingSubnets] = useState(false); // Renamed from 'loading' for clarity
+  const [pageError, setPageError] = useState<string | null>(null); // Renamed from 'error' for clarity to distinguish from hook's error
+  const [savingRules, setSavingRules] = useState(false); // Renamed from 'saving' for clarity
 
-  // Removed groupSubnets state
-  const [maskMac, setMaskMac] = useState<boolean>(true); // Default to true
+  const localStorageJobIdKey = 'subnetPageTransformJobId';
+
+  // --- Job Tracking Hook ---
+  const {
+    jobStatus,
+    isLoadingJobDetails: isLoadingHookJobDetails,
+    isProcessing: isHookProcessing,
+    error: jobHookError,
+    startJob,
+    resetJobState,
+  } = useJobTracking({
+    jobIdLocalStorageKey: localStorageJobIdKey, 
+    onJobSuccess: (completedJob) => {
+      // This onJobSuccess is for SubnetsPage specific UI updates (e.g., snackbar)
+      // The actual data refresh (fetchSessions) and localStorage update for cross-tab
+      // will be handled by useJobTracking via the onJobSuccessTriggerRefresh callback.
+      console.log('SubnetsPage: Job completed successfully via hook.', completedJob);
+      if (completedJob.result_data?.output_trace_id) {
+        console.log('SubnetsPage: output_trace_id found. Refresh handled by useJobTracking.');
+      }
+      // Optionally, clear page-specific errors on job success
+      // setPageError(null);
+    },
+    onJobSuccessTriggerRefresh: fetchSessions, // Pass fetchSessions for same-tab and cross-tab (via hook's localStorage)
+    onJobFailure: (failedJob) => {
+      // The hook itself will set its 'error' state.
+      // We can use jobHookError to display this.
+      // If additional page-specific error handling for job failure is needed, it can go here.
+      console.error('SubnetsPage: Job failed via hook:', failedJob); // Keep error log
+    },
+    onSseError: (sseError) => {
+      console.error('SubnetsPage: SSE connection error via hook:', sseError); // Keep error log
+      // The hook sets its 'error' state.
+      // setPageError('Connection error during job processing. Please check job status.'); // Example of setting page-level error
+    }
+  });
 
   // REMOVED: Fallback logic for setting sessionId from query string
-  // useEffect(() => {
-  //   const p = searchParams.get('session_id');
-  //   // This logic is removed because we need both ID and Name for setActiveSession,
-  //   // and the query parameter only provides the ID. The intended workflow
-  //   // is to select the session via the UploadPage.
-  //   // if (!sessionId && p) setActiveSession({ id: p, name: 'Unknown - From URL' }); // Example if we kept it
-  // }, [searchParams, sessionId, setActiveSession]);
 
   /* fetch subnets */
   useEffect(() => {
-    if (!sessionId) return;
-    setLoading(true);
-    getSubnets(sessionId)
-      // Correct type: getSubnets likely returns Promise<SubnetInfo[]> directly
+    // Check for both activeSession and its actual_pcap_filename
+    if (!activeSession?.id || !activeSession?.actual_pcap_filename) {
+      setSubnets([]); // Clear subnets if no active session or filename
+      resetJobState(); // Reset job state if session is lost or changes
+      if (activeSession?.id && !activeSession?.actual_pcap_filename) {
+        setPageError("Active session is missing the required PCAP filename.");
+      } else {
+        setPageError(null); // Clear error if just no session selected
+      }
+      return;
+    }
+
+    const currentSessionId = activeSession.id;
+    const currentPcapFilename = activeSession.actual_pcap_filename;
+
+    setLoadingSubnets(true);
+    setPageError(null); // Clear previous page errors
+    getSubnets(currentSessionId, currentPcapFilename) // Pass both ID and filename
       .then((data: SubnetInfo[]) => {
-        // Ensure data is an array before setting state
         const validSubnets = Array.isArray(data) ? data : [];
         setSubnets(validSubnets);
-        /* Prepare sequential transformations 10.0.0.0/8 → 10.1.0.0/8 … */
-        const t: Record<string, string> = {};
-
-        // 1️⃣ group by /8
-        const roots8 = new Map<string, SubnetInfo[]>();
-        // Add explicit type for s
-        validSubnets.forEach((s: SubnetInfo) => {
-          const [a] = s.cidr.split('.');
-          roots8.set(a, [...(roots8.get(a) || []), s]);
-        });
-
-        let nextSecond = 0; // global /8 counter (10.0, 10.1, ...)
-        roots8.forEach((list8, firstOctet) => {
-          const super8 = `${firstOctet}.0.0.0/8`;
-          const secondOctet = nextSecond++;
-          t[super8] = `10.${secondOctet}.0.0/8`;
-
-          // 2️⃣ group by /16 inside the root
-          const by16 = new Map<string, SubnetInfo[]>();
-          // Use list8 here, which is derived from validSubnets
-          list8.forEach((s: SubnetInfo) => { // Type annotation already added, ensure correct variable 'list8' is used
-            const [a, b] = s.cidr.split('.');
-            by16.set(b, [...(by16.get(b) || []), s]);
-          });
-
-          let nextThirdMap: Record<number, number> = {}; // third octet per /16 group
-
-          by16.forEach((list16, secondStr) => {
-            const super16 = `${firstOctet}.${secondStr}.0.0/16`;
-            const thirdOctet = nextThirdMap[secondOctet] ?? 0;
-            nextThirdMap[secondOctet] = thirdOctet + 1;
-            t[super16] = `10.${secondOctet}.${thirdOctet}.0/16`;
-
-            // 3️⃣ leaves
-            let nextFourth = 0;
-            list16.forEach((s: SubnetInfo) => { // Add explicit type for s
-              const [, maskStr] = s.cidr.split('/');
-              const prefix = Number(maskStr);
-              const cidr = `10.${secondOctet}.${thirdOctet}.${nextFourth}.0/${prefix}`.replace('.0.0/', '.0/');
-              t[s.cidr] = cidr;
-              nextFourth++;
-            });
-          });
-        });
-
-        setTransforms(t);
+        
+        // Generate transformations using the helper function
+        const newTransforms = generateDefaultSubnetTransformations(validSubnets);
+        setTransforms(newTransforms);
       })
-      .catch(() => setError('Error loading subnets'))
-      .finally(() => setLoading(false));
-  }, [sessionId]);
+      .catch((err: any) => {
+        console.error("Error loading subnets:", err); // Keep console log
+        let displayMessage = "An unexpected error occurred while loading subnets. Please try again or select a different session.";
+        if (err.response && err.response.data && typeof err.response.data.detail === 'string') {
+          displayMessage = `Error loading subnets: ${err.response.data.detail}`;
+        } else if (err.message) {
+          displayMessage = `Error loading subnets: ${err.message}`;
+        }
+        setPageError(displayMessage);
+      })
+      .finally(() => setLoadingSubnets(false));
+  // Depend on activeSession object itself, so it re-runs if the session or its filename changes
+  }, [activeSession, resetJobState]);
 
-  // --- Callback Handlers for SSE ---
-  // Explicitly type the callbacks to match the expected signature
-  const handleJobUpdate: (data: JobStatus) => void = (data) => {
-    if (data.status === 'pending' || data.status === 'running') {
-      setProgress(data.progress); // Use progress directly
-      setStatus({ ok: false, msg: `Progress: ${data.progress}%`, jobId: data.id });
-      setApplying(true); // Keep applying true while running/pending
-    } else if (data.status === 'completed') {
-      // Transformation job completion is handled by the new session appearing in UploadPage.
-      // We just need to update the status message and stop the 'applying' state.
-      setStatus({
-        ok: true,
-        msg: 'Transformation complete! Check Upload page for the new PCAP.',
-        jobId: data.id
-        // No direct download link here anymore
-      });
-      setApplying(false);
-      localStorage.removeItem('transformJobId'); // Clear stored job ID on completion
-      setCurrentJobId(null);
-    } else if (data.status === 'failed') {
-      // Use error_message from the JobStatus interface
-      setStatus({ ok: false, msg: `Job failed: ${data.error_message || 'Unknown error'}`, jobId: data.id });
-      setApplying(false);
-      // Consider closing EventSource here
-    }
-  };
-
-  // Explicitly type the callbacks to match the expected signature
-  const handleJobError: (err: Event | string) => void = (err) => {
-    console.error('SSE error', err);
-    // Optionally update status or show an error message
-    // setStatus({ ok: false, msg: 'Connection error during processing.' });
-    setApplying(false); // Ensure applying is set to false on error
-    // EventSource is closed automatically in api.ts on error now
-  };
-
-
-  // Resume job on page reload - Updated for integer job ID and new status handling
-  useEffect(() => {
-    const storedJobId = localStorage.getItem('transformJobId'); // Use a specific key
-    const jobId = storedJobId ? parseInt(storedJobId, 10) : null;
-
-    if (jobId && !isNaN(jobId) && sessionId) {
-      setCurrentJobId(jobId); // Set the current job ID state
-      setApplying(true); // Assume it's applying if we have a job ID
-      setStatus({ ok: false, msg: 'Resuming previous job status...', jobId });
-
-      // Define the onMessage handler specifically for resuming with explicit type
-      const resumeOnMessage: (data: JobStatus) => void = (data) => {
-          if (data.status === 'pending' || data.status === 'running') {
-            setProgress(data.progress);
-            setStatus({ ok: false, msg: `Progress: ${data.progress}%`, jobId: data.id });
-            setApplying(true); // Keep applying true
-          } else if (data.status === 'completed') {
-             setStatus({
-               ok: true,
-               msg: 'Transformation complete! Check Upload page.',
-               jobId: data.id
-             });
-             setApplying(false);
-             localStorage.removeItem('transformJobId'); // Clear stored job ID
-             setCurrentJobId(null);
-             // Don't close es here, let return cleanup handle it
-          } else if (data.status === 'failed') {
-            setStatus({ ok: false, msg: `Job failed: ${data.error_message || 'Unknown error'}`, jobId: data.id });
-            setApplying(false);
-             // Don't close es here
-          }
-      };
-
-      // Define the onError handler specifically for resuming with explicit type
-      const resumeOnError: (err: Event | string) => void = (err) => {
-          console.error('SSE error on resume', err);
-          // Don't close es here, let return cleanup handle it
-      };
-
-      // Pass job ID as string to subscribeJobEvents
-      const es = subscribeJobEvents(jobId.toString(), resumeOnMessage, resumeOnError);
-      // Return cleanup function to close EventSource when component unmounts or dependencies change
-      return () => {
-          console.log("Closing EventSource from useEffect cleanup");
-          es.close();
-      };
-    }
-  }, [sessionId]); // Removed groupSubnets from dependency array
+  // Old job handling (useEffect for resuming job, handleJobUpdate, handleJobError)
+  // is removed as useJobTracking now manages this.
+  // The useJobTracking hook will internally handle resuming from localStorageJobIdKey.
 
   // Directly map subnets to rows needed by DataGrid
   const rows = React.useMemo<SubnetRow[]>(() =>
@@ -290,7 +279,7 @@ const SubnetsPage: React.FC = () => {
       try {
         setTransforms(JSON.parse(r.result as string));
       } catch {
-        setError('Invalid JSON');
+        setPageError('Invalid JSON'); // Corrected: Use setPageError
       }
     };
     r.readAsText(f);
@@ -303,107 +292,136 @@ const SubnetsPage: React.FC = () => {
       .map(([source, target]) => ({ source, target }));
 
   const handleApply = async () => {
-    if (!sessionId) return;
+    // Check for activeSession and its filename before proceeding
+    if (!activeSession?.id || !activeSession?.actual_pcap_filename) {
+      setPageError('Cannot apply changes: No active session or PCAP filename is available.');
+      return;
+    }
+    const currentSessionId = activeSession.id;
+    const currentPcapFilename = activeSession.actual_pcap_filename;
+
     const payload = ruleArray();
     if (!payload.length) {
-      setError('You must define at least one valid rule');
+      setPageError('You must define at least one valid rule');
       return;
     }
-    setSaving(true);
-    setStatus({ ok: false, msg: 'Saving rules…' });
-    try {
-      await saveRules(sessionId, payload);
-    } catch {
-      setStatus({ ok: false, msg: 'Failed to save rules' });
-      setSaving(false);
-      return;
-    }
-    setSaving(false);
+    setSavingRules(true);
+    setPageError(null); // Clear previous page errors
+    // jobHookError is managed by the hook, so no need to clear it here unless specifically intended
 
-    // Start async transformation job
-    setStatus({ ok: false, msg: 'Starting transformation job…' });
-    let jobDetails: JobListResponse; // Use the new response type
     try {
-      // Call the new API function
-      jobDetails = await startTransformationJob(sessionId);
-      const newJobId = jobDetails.id; // Get the integer job ID
-      setCurrentJobId(newJobId); // Store the new job ID
-      localStorage.setItem('transformJobId', newJobId.toString()); // Store job ID for resume
-      setStatus({ ok: false, msg: 'Job queued, waiting for progress…', jobId: newJobId });
+      // Use currentSessionId for saving rules
+      await saveRules(currentSessionId, payload);
     } catch (err: any) {
-      console.error("Failed to start transformation job:", err);
-      setStatus({ ok: false, msg: `Failed to start job: ${err?.response?.data?.detail || err.message}` });
-      setSaving(false); // Ensure saving is reset on error
+      console.error("Failed to save rules:", err); // Keep error log
+      let displayMessage = "An unexpected error occurred while saving rules. Please try again.";
+        if (err.response && err.response.data && typeof err.response.data.detail === 'string') {
+          displayMessage = `Failed to save rules: ${err.response.data.detail}`;
+        } else if (err.message) {
+          displayMessage = `Failed to save rules: ${err.message}`;
+        } else if (err.response?.status) {
+          displayMessage = `Failed to save rules: An unknown server error occurred (status ${err.response.status}).`;
+        }
+      setPageError(displayMessage);
+      setSavingRules(false);
       return;
     }
+    setSavingRules(false);
 
-    // Subscribe to events using the new integer job ID (converted to string)
-    const es = subscribeJobEvents(jobDetails.id.toString(), handleJobUpdate, handleJobError);
+    // Now start the job using the hook
+    const apiCallToStartJob = async () => {
+        // We already checked activeSession and filename at the start of handleApply
+        if (!currentSessionId || !currentPcapFilename) {
+          throw new Error("Session ID or PCAP filename became unavailable unexpectedly.");
+        }
+        // Pass both ID and filename to the API call
+        return startTransformationJob(currentSessionId, currentPcapFilename);
+    };
 
-    // Cleanup function for this specific EventSource instance if handleApply is interrupted
-    // Note: This cleanup might be tricky if the component unmounts before the job finishes.
-    // The useEffect cleanup is generally more reliable for long-running subscriptions.
-    // For simplicity, we rely on the useEffect cleanup for now.
-
-    setApplying(true); // Set applying to true immediately after starting job
+    // The hook will set its own loading/processing states (isHookProcessing, isLoadingHookJobDetails)
+    // and manage jobStatus and jobHookError.
+    startJob(apiCallToStartJob);
   };
 
   /* ---------------------------------------------------------- */
 
-  if (!sessionId) return <Alert severity="info">Upload a PCAP first.</Alert>;
+  // Check activeSession existence for page rendering
+  if (!activeSession?.id) return <Alert severity="info">Select a PCAP trace from the Upload page first.</Alert>;
+
+  // Determine UI status message based on job state from hook
+  const getJobStatusMessageFromHook = (): { text: string; severity: 'info' | 'success' | 'warning' | 'error' } | null => {
+    if (isLoadingHookJobDetails) return { text: 'Loading job details...', severity: 'info' };
+    if (!jobStatus) return null; // No active job from hook to display status for
+
+    switch (jobStatus.status) {
+      case 'pending':
+        return { text: `Job (ID: ${jobStatus.id}) is pending...`, severity: 'info' };
+      case 'running':
+        return { text: `Job (ID: ${jobStatus.id}) is running... Progress: ${jobStatus.progress}%`, severity: 'info' };
+      case 'completed':
+        return { text: `Job (ID: ${jobStatus.id}) completed successfully! Check Upload page.`, severity: 'success' };
+      case 'failed':
+        return { text: `Job (ID: ${jobStatus.id}) failed: ${jobStatus.error_message || 'Unknown error'}`, severity: 'error' };
+      case 'cancelled':
+        return { text: `Job (ID: ${jobStatus.id}) was cancelled.`, severity: 'warning' };
+      case 'cancelling':
+        return { text: `Job (ID: ${jobStatus.id}) is cancelling...`, severity: 'info' };
+      default:
+        // Should not happen if JobStatus type is strict
+        return { text: `Job (ID: ${jobStatus.id}) status: ${jobStatus.status}`, severity: 'info' };
+    }
+  };
+
+  const currentJobStatusMessage = getJobStatusMessageFromHook();
 
   return (
     <Box>
       <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
         <Typography variant="h5">Detected subnets</Typography>
         <Box>
-          <Button variant="contained" startIcon={<SaveAltIcon />} onClick={handleExport} sx={{ mr: 1 }} disabled={applying}>
+          <Button variant="contained" startIcon={<SaveAltIcon />} onClick={handleExport} sx={{ mr: 1 }} disabled={isHookProcessing || savingRules || isLoadingHookJobDetails}>
             Export
           </Button>
-          <Button component="label" variant="contained" startIcon={<FolderOpenIcon />} sx={{ mr: 1 }} disabled={applying}>
+          <Button component="label" variant="contained" startIcon={<FolderOpenIcon />} sx={{ mr: 1 }} disabled={isHookProcessing || savingRules || isLoadingHookJobDetails}>
             Import
             <input hidden type="file" accept="application/json" onChange={handleImport} />
           </Button>
           <Button
             variant="contained"
             startIcon={<PlayArrowIcon />}
-            disabled={saving || applying}
+            disabled={savingRules || isHookProcessing || isLoadingHookJobDetails}
             onClick={handleApply}
           >
-            {applying ? 'Processing…' : 'Apply changes'}
+            {isHookProcessing || isLoadingHookJobDetails ? 'Processing…' : 'Apply Changes'}
           </Button>
         </Box>
       </Box>
-      <Box display="flex" gap={4} mb={2}>
-        {/* Removed "Group by subnet" checkbox */}
-        <FormControlLabel
-          control={
-            <Checkbox
-              checked={maskMac}
-              onChange={(e) => setMaskMac(e.target.checked)}
-            />
-          }
-          label="Mask MAC addresses (keep vendor OUI)"
-        />
-      </Box>
+      {/* Removed "Group by subnet" checkbox and maskMac FormControlLabel */}
 
-      {status && (
-        <Alert severity={status.ok ? 'success' : 'info'} sx={{ mb: 2 }}>
-          {status.msg}
-          {/* Removed status.dl block entirely */}
+      {/* Display page-specific errors (e.g., subnet loading, rule saving) */}
+      {pageError && <Alert severity="error" sx={{ mb: 2 }}>{pageError}</Alert>}
+      
+      {/* Display job-specific errors from the hook */}
+      {jobHookError && <Alert severity="error" sx={{ mb: 2 }}>{jobHookError}</Alert>}
+
+      {/* Display job status message from hook */}
+      {currentJobStatusMessage && !jobHookError && ( // Avoid showing job status if there's a specific job error from hook
+        <Alert severity={currentJobStatusMessage.severity} sx={{ mb: 2 }}>
+          {currentJobStatusMessage.text}
         </Alert>
       )}
-      {/* Show progress only when applying and progress is positive */}
-      {applying && progress > 0 && progress < 100 && (
+
+      {/* Show progress bar for running jobs from hook */}
+      {jobStatus && jobStatus.status === 'running' && typeof jobStatus.progress === 'number' && jobStatus.progress >= 0 && jobStatus.progress <= 100 && (
         <Box sx={{ width: '100%', mb: 2 }}>
-          <LinearProgress variant="determinate" value={progress} />
+          <LinearProgress variant="determinate" value={jobStatus.progress} />
         </Box>
       )}
+      
+      {/* Show loading spinner for initial subnet load or job detail loading from hook */}
+      {(loadingSubnets || isLoadingHookJobDetails) && <CircularProgress sx={{ mb: 2 }}/>}
 
-      {loading && <CircularProgress />}
-      {error && <Alert severity="error">{error}</Alert>}
-
-      {!loading && !error && (
+      {!loadingSubnets && ( // Keep DataGrid visible even if there's an error, but not if subnets are loading
         <Paper sx={{ flex: 1, minHeight: 0, width: 650 }}>
           <DataGrid
             rows={rows}

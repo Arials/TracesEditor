@@ -1,13 +1,18 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
+import React, { useState, useEffect, useCallback, useContext } from 'react'; // Added useContext
+import { useNavigate, Link as RouterLink } from 'react-router-dom';
+import axios from 'axios'; // Import axios for error checking
 import {
   listJobs,
   subscribeJobEvents,
   JobListResponse,
-  JobStatus, // Use the JobStatus type alias from api.ts
-  stopJob,   // Import stopJob
-  deleteJob, // Import deleteJob
+  JobStatus,
+  stopJob,
+  deleteJob,
+  downloadSessionFile,
+  getSessionById, // Import getSessionById
+  PcapSession,    // Import PcapSession
 } from '../services/api';
+import { SessionContext, useSession } from '../context/SessionContext'; // Import useSession
 
 // Material UI Imports
 import {
@@ -26,84 +31,146 @@ import {
   Chip,
   Button,
   Tooltip,
-  IconButton, // Import IconButton
+  IconButton,
+  Snackbar, // For notifications
 } from '@mui/material';
-import PlayCircleOutlineIcon from '@mui/icons-material/PlayCircleOutline'; // Icon for DICOM result link
+import PlayCircleOutlineIcon from '@mui/icons-material/PlayCircleOutline'; // Icon for DICOM result/review link
 import DownloadIcon from '@mui/icons-material/Download'; // Icon for potential future download links
-import StopCircleIcon from '@mui/icons-material/StopCircle'; // Icon for Stop button
-import DeleteIcon from '@mui/icons-material/Delete'; // Icon for Delete button
-import RefreshIcon from '@mui/icons-material/Refresh'; // Icon for Refresh button
+import StopCircleIcon from '@mui/icons-material/StopCircle';
+import DeleteIcon from '@mui/icons-material/Delete';
+import RefreshIcon from '@mui/icons-material/Refresh';
 
 // Define the shape of a row in our jobs table
 interface JobRow extends JobListResponse {
-  // No extra fields needed currently, inherits all from JobListResponse
+  // No extra fields needed
 }
 
-const AsyncPage: React.FC = () => {
+// --- Define Props Interface ---
+interface AsyncPageProps {
+  // refreshSessionList is no longer needed as SessionContext handles updates
+}
+
+const AsyncPage: React.FC<AsyncPageProps> = () => { // Removed refreshSessionList from props
   const navigate = useNavigate();
+  const { addSession } = useSession(); // Get addSession from context
   const [jobs, setJobs] = useState<JobRow[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
-  const [error, setError] = useState<string | null>(null);
-  const [liveJobStatuses, setLiveJobStatuses] = useState<Record<number, JobStatus>>({}); // Store live updates by job ID
-  const [stoppingJobs, setStoppingJobs] = useState<Record<number, boolean>>({}); // Track stopping state by job ID
-  const [deletingJobs, setDeletingJobs] = useState<Record<number, boolean>>({}); // Track deleting state by job ID
+  const [error, setError] = useState<string | null>(null); // For general page errors
+  const [notification, setNotification] = useState<{ message: string; severity: 'success' | 'error' | 'warning' | 'info' } | null>(null);
+  const [liveJobStatuses, setLiveJobStatuses] = useState<Record<number, JobStatus>>({});
+  const [stoppingJobs, setStoppingJobs] = useState<Record<number, boolean>>({});
+  const [deletingJobs, setDeletingJobs] = useState<Record<number, boolean>>({});
+  const [downloadingFiles, setDownloadingFiles] = useState<Record<string, boolean>>({}); // Tracks download state for individual files
 
-  // --- Fetch Initial Job List ---
+  // --- Data Fetching Callbacks ---
+
+  /**
+   * Fetches the list of all background jobs from the backend.
+   * Updates component state with the fetched jobs, loading status, and any errors.
+   */
   const fetchJobs = useCallback(async () => {
-    console.log('[AsyncPage] Fetching initial job list...');
+    // console.log('[AsyncPage] Fetching initial job list...');
     setLoading(true);
-    setError(null);
+    setError(null); // Clear previous errors
     try {
       const jobList = await listJobs();
-      console.log('[AsyncPage] Received job list:', jobList);
+      // console.log('[AsyncPage] Received job list:', jobList);
       setJobs(jobList); // Assuming listJobs returns data compatible with JobRow
       if (jobList.length === 0) {
         setError('No background jobs found.'); // Use info/warning severity later
       }
     } catch (err: any) {
       console.error('[AsyncPage] Error fetching job list:', err);
-      setError(err?.response?.data?.detail || err?.message || 'Failed to fetch job list.');
+      let displayMessage = "An unexpected error occurred while fetching the job list.";
+      if (axios.isAxiosError(err)) {
+        if (err.response && err.response.data && typeof err.response.data.detail === 'string') {
+            displayMessage = `Failed to fetch job list: ${err.response.data.detail}`;
+        } else if (err.message) {
+            displayMessage = `Failed to fetch job list: ${err.message}`;
+        }
+      } else if (err instanceof Error && err.message) {
+        displayMessage = `Failed to fetch job list: ${err.message}`;
+      }
+      setError(displayMessage);
       setJobs([]); // Clear jobs on error
     } finally {
       setLoading(false);
     }
   }, []);
 
-  // --- Effect for Initial Fetch ---
+  // Effect to fetch the initial list of jobs when the component mounts.
   useEffect(() => {
     fetchJobs();
-  }, [fetchJobs]);
+  }, [fetchJobs]); // fetchJobs is memoized, so this runs once on mount.
+
+  // Effect to listen for storage events to refresh jobs (e.g., after clearAllData)
+  useEffect(() => {
+    const handleStorageChange = (event: StorageEvent) => {
+      if (event.key === 'jobDataLastClearedTimestamp') {
+        // console.log('[AsyncPage] Detected jobDataLastClearedTimestamp change, refreshing jobs.');
+        fetchJobs();
+      }
+    };
+
+    window.addEventListener('storage', handleStorageChange);
+
+    return () => {
+      window.removeEventListener('storage', handleStorageChange);
+    };
+  }, [fetchJobs]); // Depends on fetchJobs to call the correct instance
 
   // --- Action Handlers ---
+
+  /**
+   * Sends a request to the backend to stop a running or pending job.
+   * Manages loading state for the specific job being stopped.
+   * @param jobId - The ID of the job to stop.
+   */
   const handleStopJob = async (jobId: number) => {
     setStoppingJobs(prev => ({ ...prev, [jobId]: true }));
     try {
-      console.log(`[AsyncPage] Requesting stop for job ${jobId}`);
+      // console.log(`[AsyncPage] Requesting stop for job ${jobId}`);
       await stopJob(jobId);
       // Optionally show a success message, or rely on SSE to update status to 'cancelling'/'cancelled'
-      console.log(`[AsyncPage] Stop request sent for job ${jobId}`);
-      // Force a refresh of live status to potentially show 'cancelling' sooner
-      setLiveJobStatuses(prev => ({
-        ...prev,
-        [jobId]: { ...prev[jobId], status: 'cancelling' } as JobStatus, // Optimistic update
-      }));
+      // console.log(`[AsyncPage] Stop request sent for job ${jobId}`);
+        // Force a refresh of live status to potentially show 'cancelling' sooner
+        setLiveJobStatuses(prev => ({
+          ...prev,
+          [jobId]: { ...prev[jobId], status: 'cancelling' } as JobStatus, // Optimistic update
+        }));
     } catch (err: any) {
       console.error(`[AsyncPage] Error stopping job ${jobId}:`, err);
-      setError(`Failed to stop job ${jobId}: ${err?.response?.data?.detail || err?.message || 'Unknown error'}`);
+      let displayMessage = `An unexpected error occurred while trying to stop job ${jobId}.`;
+      if (axios.isAxiosError(err)) {
+        if (err.response && err.response.data && typeof err.response.data.detail === 'string') {
+            displayMessage = `Failed to stop job ${jobId}: ${err.response.data.detail}`;
+        } else if (err.message) {
+            displayMessage = `Failed to stop job ${jobId}: ${err.message}`;
+        }
+      } else if (err instanceof Error && err.message) {
+        displayMessage = `Failed to stop job ${jobId}: ${err.message}`;
+      }
+      setError(displayMessage);
     } finally {
       setStoppingJobs(prev => ({ ...prev, [jobId]: false }));
     }
   };
 
+  /**
+   * Deletes the record of a job from the backend after user confirmation.
+   * Manages loading state for the specific job being deleted.
+   * Updates local state to remove the job from the list on success.
+   * @param jobId - The ID of the job to delete.
+   */
   const handleDeleteJob = async (jobId: number) => {
-    if (!window.confirm(`Are you sure you want to delete the record for job ${jobId}?`)) {
+    if (!window.confirm(`Are you sure you want to delete the record for job ${jobId}? This does not stop a running job.`)) {
       return;
     }
     setDeletingJobs(prev => ({ ...prev, [jobId]: true }));
     try {
-      console.log(`[AsyncPage] Deleting job ${jobId}`);
+      // console.log(`[AsyncPage] Deleting job ${jobId}`);
       await deleteJob(jobId);
-      console.log(`[AsyncPage] Job ${jobId} deleted successfully`);
+      // console.log(`[AsyncPage] Job ${jobId} deleted successfully`);
       // Remove the job from the local state
       setJobs(prev => prev.filter(j => j.id !== jobId));
       // Also remove from live statuses if present
@@ -114,92 +181,194 @@ const AsyncPage: React.FC = () => {
       });
     } catch (err: any) {
       console.error(`[AsyncPage] Error deleting job ${jobId}:`, err);
-      setError(`Failed to delete job ${jobId}: ${err?.response?.data?.detail || err?.message || 'Unknown error'}`);
+      let displayMessage = `An unexpected error occurred while trying to delete job ${jobId}.`;
+      if (axios.isAxiosError(err)) {
+        if (err.response && err.response.data && typeof err.response.data.detail === 'string') {
+            displayMessage = `Failed to delete job ${jobId}: ${err.response.data.detail}`;
+        } else if (err.message) {
+            displayMessage = `Failed to delete job ${jobId}: ${err.message}`;
+        }
+      } else if (err instanceof Error && err.message) {
+        displayMessage = `Failed to delete job ${jobId}: ${err.message}`;
+      }
+      setError(displayMessage);
     } finally {
       setDeletingJobs(prev => ({ ...prev, [jobId]: false }));
     }
   };
 
-  // --- SSE Handling for Live Updates ---
-  useEffect(() => {
-    const eventSources: Record<number, EventSource> = {};
+  /**
+   * Initiates the download of a file associated with a job's session.
+   * Manages loading state for the specific file download.
+   * @param sessionId - The ID of the session containing the file.
+   * @param filename - The name of the file to download.
+   * @param jobId - The ID of the job (used for managing download loading state key).
+   */
+  const handleDownloadFile = async (sessionId: string, filename: string, jobId: number) => {
+    const downloadKey = `${jobId}-${filename}`; // Unique key for tracking download state
+    setDownloadingFiles(prev => ({ ...prev, [downloadKey]: true }));
+    setError(null); // Clear previous page-level errors
+    try {
+      // console.log(`[AsyncPage] Attempting download for session ${sessionId}, file ${filename}`);
+      await downloadSessionFile(sessionId, filename);
+      // No explicit success message needed as the browser handles the download prompt
+    } catch (err: any) {
+      console.error(`[AsyncPage] Error downloading file ${filename}:`, err);
+      // The downloadSessionFile in api.ts might already format a good message.
+      // If not, or for more specific context:
+      let displayMessage = `An unexpected error occurred while downloading ${filename}.`;
+      if (err instanceof Error && err.message) { // err.message from downloadSessionFile is usually good
+        displayMessage = err.message;
+      } else if (axios.isAxiosError(err)) {
+        if (err.response && err.response.data && typeof err.response.data.detail === 'string') {
+            displayMessage = `Failed to download ${filename}: ${err.response.data.detail}`;
+        } else if (err.message) {
+            displayMessage = `Failed to download ${filename}: ${err.message}`;
+        }
+      }
+      setError(displayMessage);
+    } finally {
+      setDownloadingFiles(prev => ({ ...prev, [downloadKey]: false }));
+    }
+  };
 
-    // Function to handle incoming SSE messages
+  // --- SSE Handling for Live Job Status Updates ---
+  useEffect(() => {
+    const eventSources: Record<number, EventSource> = {}; // Stores active EventSource connections, keyed by job ID.
+
+    /**
+     * Callback function to handle incoming Server-Sent Events (SSE) messages
+     * with live updates for a job's status.
+     * @param data - The JobStatus object received from the SSE stream.
+     */
     const handleJobUpdate = (data: JobStatus) => {
-      console.log(`[AsyncPage] SSE Update for Job ${data.id}:`, data);
-      setLiveJobStatuses(prev => ({
-        ...prev,
-        [data.id]: data, // Update the status for the specific job ID
+      // console.log(`[AsyncPage] SSE Update for Job ${data.id}:`, data);
+      setLiveJobStatuses(prevLiveStatuses => ({
+        ...prevLiveStatuses,
+        [data.id]: data,
       }));
 
-      // If job completes or fails, stop listening for this specific job?
-      // Or let the SSE generator on the backend handle closing the stream.
-      // Current backend implementation closes stream on completion/failure.
+      // --- Handle new trace creation on job completion ---
+      const transformationJobTypes: JobStatus['job_type'][] = ['transform', 'mac_transform', 'dicom_anonymize_v2'];
+      if (data.status === 'completed' && transformationJobTypes.includes(data.job_type)) {
+        if (data.output_trace_id) {
+          // console.log(`[AsyncPage] Transformation job ${data.id} completed. Output trace ID: ${data.output_trace_id}. Fetching details...`);
+          getSessionById(data.output_trace_id)
+            .then((newlyFetchedSession: PcapSession) => {
+              addSession(newlyFetchedSession);
+              setNotification({ message: `New trace '${newlyFetchedSession.name}' created successfully.`, severity: 'success' });
+              // Navigate to a page where the new trace is visible, e.g., the main list or the new trace's detail page
+              // For now, navigating to /uploads which typically shows the Sidebar with the session list.
+              navigate('/uploads'); 
+            })
+            .catch(fetchErr => {
+              console.error(`[AsyncPage] Error fetching new trace details for ${data.output_trace_id}:`, fetchErr);
+              let displayMessage = `Job ${data.id} completed, but an unexpected error occurred while fetching new trace details.`;
+              if (axios.isAxiosError(fetchErr)) {
+                if (fetchErr.response && fetchErr.response.data && typeof fetchErr.response.data.detail === 'string') {
+                    displayMessage = `Job ${data.id} completed, but failed to fetch new trace details: ${fetchErr.response.data.detail}`;
+                } else if (fetchErr.message) {
+                    displayMessage = `Job ${data.id} completed, but failed to fetch new trace details: ${fetchErr.message}`;
+                }
+              } else if (fetchErr instanceof Error && fetchErr.message) {
+                displayMessage = `Job ${data.id} completed, but failed to fetch new trace details: ${fetchErr.message}`;
+              }
+              setNotification({ message: displayMessage, severity: 'error' });
+            });
+        } else {
+          console.warn(`[AsyncPage] Transformation job ${data.id} completed but no output_trace_id was provided.`);
+          setNotification({ message: `Job ${data.id} completed, but no output trace ID was found.`, severity: 'warning' });
+        }
+      }
+
+      // The backend is expected to close the SSE stream when a job reaches a terminal state (completed, failed, cancelled).
     };
 
-    // Function to handle SSE errors
-    const handleJobError = (jobId: number) => (err: Event | string) => {
-      console.error(`[AsyncPage] SSE Error for Job ${jobId}:`, err);
-      // Maybe update the status to show a connection error?
-      setLiveJobStatuses(prev => ({
-        ...prev,
-        [jobId]: { ...prev[jobId], status: 'failed', error_message: 'SSE Connection Error' } as JobStatus,
+    /**
+     * Higher-order function to create an error handler for a specific job's SSE connection.
+     * @param jobId - The ID of the job whose SSE connection encountered an error.
+     * @returns An error handling function for the EventSource.
+     */
+    const handleSseError = (jobId: number) => (errorEvent: Event | string) => {
+      console.error(`[AsyncPage] SSE Connection Error for Job ${jobId}:`, errorEvent);
+      // Update the job's live status to indicate an SSE error.
+      // This helps the user understand why updates might have stopped.
+      setLiveJobStatuses(prevLiveStatuses => ({
+        ...prevLiveStatuses,
+        [jobId]: { 
+          ...(prevLiveStatuses[jobId] || { id: jobId, status: 'unknown' }), // Ensure base object if not present
+          status: 'failed', // Or a custom 'sse_error' status if preferred
+          error_message: 'SSE connection lost. Status may be outdated.' 
+        } as JobStatus, // Type assertion
       }));
-      // Clean up this specific EventSource
+      // Clean up the problematic EventSource.
       if (eventSources[jobId]) {
         eventSources[jobId].close();
         delete eventSources[jobId];
       }
     };
 
-    // Subscribe to events for jobs that are still pending or running
+    // Iterate over the initially fetched jobs to establish SSE connections for active ones.
     jobs.forEach(job => {
-      const liveStatus = liveJobStatuses[job.id]?.status;
-      const initialStatus = job.status;
-      // Subscribe if we don't have a live status yet and the initial status is pending/running,
-      // OR if the live status we have is still pending/running.
-      if ((!liveStatus && (initialStatus === 'pending' || initialStatus === 'running')) ||
-          (liveStatus === 'pending' || liveStatus === 'running'))
-      {
-        if (!eventSources[job.id]) { // Avoid duplicate subscriptions
-          console.log(`[AsyncPage] Subscribing to SSE for active job ${job.id}`);
+      const currentLiveStatus = liveJobStatuses[job.id]?.status;
+      const initialJobStatus = job.status;
+
+      // Determine if an SSE connection should be active for this job.
+      // Conditions:
+      // 1. No live status yet, and initial status is 'pending' or 'running'.
+      // 2. Existing live status is 'pending' or 'running'.
+      const shouldBeActive = 
+        (!currentLiveStatus && (initialJobStatus === 'pending' || initialJobStatus === 'running')) ||
+        (currentLiveStatus === 'pending' || currentLiveStatus === 'running');
+
+      if (shouldBeActive) {
+        if (!eventSources[job.id]) { // Avoid creating duplicate EventSource objects.
+          // console.log(`[AsyncPage] Subscribing to SSE for active job ${job.id} (Status: ${currentLiveStatus || initialJobStatus})`);
           eventSources[job.id] = subscribeJobEvents(
-            job.id.toString(), // Pass job ID as string
-            handleJobUpdate,
-            handleJobError(job.id) // Pass job ID to error handler
+            job.id.toString(),
+            handleJobUpdate,      // Handler for successful messages
+            handleSseError(job.id) // Handler for SSE connection errors
           );
         }
       } else {
-         // If job is completed/failed and we have an active SSE connection, close it
-         if (eventSources[job.id]) {
-             console.log(`[AsyncPage] Closing SSE for completed/failed job ${job.id}`);
-             eventSources[job.id].close();
-             delete eventSources[job.id];
-         }
+        // If the job is in a terminal state (completed, failed, etc.) and an EventSource exists, close it.
+        if (eventSources[job.id]) {
+          // console.log(`[AsyncPage] Closing SSE for job ${job.id} (Status: ${currentLiveStatus || initialJobStatus}) as it's in a terminal state.`);
+          eventSources[job.id].close();
+          delete eventSources[job.id];
+        }
       }
     });
 
-    // Cleanup function: Close all active SSE connections when component unmounts or jobs list changes
+    // Cleanup function: Close all active SSE connections when the component unmounts or when the `jobs` dependency changes.
+    // This is crucial to prevent memory leaks and unnecessary network activity.
     return () => {
-      console.log('[AsyncPage] Cleaning up SSE connections...');
-      Object.values(eventSources).forEach(es => es.close());
+      // console.log('[AsyncPage] Cleaning up all active SSE connections...');
+      Object.values(eventSources).forEach(eventSourceInstance => eventSourceInstance.close());
     };
-  // DEPENDENCY ARRAY CHANGED: Only depends on the initial job list now.
-  }, [jobs]); // Re-run ONLY when the initial jobs list changes.
+  }, [jobs, addSession, navigate, liveJobStatuses]); // Added liveJobStatuses to re-evaluate SSE connections if a job is stopped manually.
 
-  // --- Helper to Get Status Chip ---
-  const getStatusChip = (status: JobStatus['status']) => {
+  /**
+   * Helper function to render a Material UI Chip based on the job status.
+   * @param status - The status string of the job.
+   * @returns A Chip component styled according to the job status.
+   */
+  const getStatusChip = (status: JobStatus['status']): React.ReactElement => {
     switch (status) {
       case 'completed':
-        return <Chip label="Completed" color="success" size="small" />;
+        return <Chip label="Completed" color="success" size="small" variant="outlined" />;
       case 'running':
-        return <Chip label="Running" color="info" size="small" />;
+        return <Chip label="Running" color="info" size="small" variant="outlined" />;
       case 'pending':
-        return <Chip label="Pending" color="warning" size="small" />;
+        return <Chip label="Pending" color="warning" size="small" variant="outlined" />;
       case 'failed':
-        return <Chip label="Failed" color="error" size="small" />;
+        return <Chip label="Failed" color="error" size="small" variant="outlined" />;
+      case 'cancelled':
+        return <Chip label="Cancelled" color="default" size="small" variant="outlined" />;
+      case 'cancelling':
+        return <Chip label="Cancelling" color="info" size="small" variant="outlined" />;
       default:
-        return <Chip label={status || 'Unknown'} size="small" />;
+        return <Chip label={status || 'Unknown'} size="small" variant="outlined" />;
     }
   };
 
@@ -226,22 +395,30 @@ const AsyncPage: React.FC = () => {
         </Alert>
       )}
 
+      {/* Notification Snackbar */}
+      {notification && (
+        <Snackbar
+          open
+          autoHideDuration={6000}
+          onClose={() => setNotification(null)}
+          anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+        >
+          <Alert onClose={() => setNotification(null)} severity={notification.severity} sx={{ width: '100%' }}>
+            {notification.message}
+          </Alert>
+        </Snackbar>
+      )}
+
       {!loading && jobs.length > 0 && (
         <TableContainer component={Paper}>
           <Table sx={{ minWidth: 650 }} aria-label="background jobs table">
-            <TableHead>
-              <TableRow>
-                <TableCell>Job ID</TableCell>
-                <TableCell>Type</TableCell>
+            <TableHead><TableRow><TableCell>Job ID</TableCell><TableCell>Type</TableCell>
                 <TableCell>Trace Name</TableCell> {/* Changed Header */}
                 <TableCell>Status</TableCell>
                 <TableCell>Progress</TableCell>
                 <TableCell>Created</TableCell>
-                <TableCell>Last Updated</TableCell>
-                <TableCell>Result / Error</TableCell>
-                <TableCell>Actions</TableCell> {/* Added Actions Header */}
-              </TableRow>
-            </TableHead>
+                <TableCell>Last Updated</TableCell><TableCell>Result / Error</TableCell><TableCell>Actions</TableCell>{/* Added Actions Header */}
+              </TableRow></TableHead>
             <TableBody>
               {jobs.map((job) => {
                 // Use live status if available, otherwise use initial job status
@@ -260,8 +437,7 @@ const AsyncPage: React.FC = () => {
                   <TableRow
                     key={job.id}
                     sx={{ '&:last-child td, &:last-child th': { border: 0 } }}
-                  >
-                    <TableCell component="th" scope="row">
+                  ><TableCell component="th" scope="row">
                       {job.id}
                     </TableCell>
                     <TableCell>{displayStatus.job_type}</TableCell>
@@ -295,25 +471,53 @@ const AsyncPage: React.FC = () => {
                           </Typography>
                         </Tooltip>
                       )}
+                      {/* Button for completed 'dicom_extract' jobs */}
                       {isCompleted && displayStatus.job_type === 'dicom_extract' && (
                          <Button
                             size="small"
                             variant="outlined"
                             startIcon={<PlayCircleOutlineIcon />}
-                            onClick={() => navigate(`/dicom?job_id=${job.id}`)} // Navigate using job ID
+                            onClick={() => navigate(`/dicom?job_id=${job.id}`)} // Navigate to DicomPage
                          >
                             View DICOM
                          </Button>
                       )}
-                       {isCompleted && displayStatus.job_type === 'transform' && (
-                         <Typography variant="caption" color="text.secondary">
-                            (See Upload Page)
-                         </Typography>
+                      {/* Button for completed 'dicom_metadata_review' jobs */}
+                      {isCompleted && displayStatus.job_type === 'dicom_metadata_review' && (
+                         <Button
+                            size="small"
+                            variant="outlined"
+                            startIcon={<PlayCircleOutlineIcon />} // Reuse icon or choose another like RateReviewIcon
+                            // Link to the DicomAnonymizationV2Page, passing the job ID
+                            component={RouterLink}
+                            to={`/dicom-anonymization-v2?job_id=${job.id}`}
+                         >
+                            Review Metadata
+                         </Button>
+                      )}
+                       {isCompleted && (displayStatus.job_type === 'transform' || displayStatus.job_type === 'mac_transform' || displayStatus.job_type === 'dicom_anonymize_v2') && displayStatus.output_trace_id && (
+                        <Button
+                          size="small"
+                          variant="text" // Changed to text to imply navigation/view
+                          color="primary"
+                          onClick={() => navigate(`/uploads`)} // Or a specific trace view page
+                        >
+                          View New Trace
+                        </Button>
                        )}
-                      {/* Add download button for transformed PCAPs if needed later */}
-                      {/* {isCompleted && displayStatus.job_type === 'transform' && (
-                         <Button size="small" startIcon={<DownloadIcon />}>Download PCAP</Button>
-                      )} */}
+                       {/* Download Rules for MAC Transform */}
+                       {isCompleted && displayStatus.job_type === 'mac_transform' && displayStatus.output_trace_id && (
+                        <Button
+                          size="small"
+                          variant="outlined"
+                          startIcon={downloadingFiles[`${job.id}-mac_rules.json`] ? <CircularProgress size={16} /> : <DownloadIcon />}
+                          onClick={() => handleDownloadFile(displayStatus.output_trace_id!, 'mac_rules.json', job.id)}
+                          disabled={downloadingFiles[`${job.id}-mac_rules.json`]}
+                          sx={{ ml: 1 }} // Add some margin if next to another button
+                        >
+                          Download Rules
+                        </Button>
+                       )}
                     </TableCell>
                     {/* --- Actions Cell --- */}
                     <TableCell>
@@ -348,8 +552,7 @@ const AsyncPage: React.FC = () => {
                           </span>
                         </Tooltip>
                       </Box>
-                    </TableCell>
-                  </TableRow>
+                    </TableCell></TableRow>
                 );
               })}
             </TableBody>

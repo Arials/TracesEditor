@@ -1,1179 +1,1545 @@
 # --- Imports ---
+import sys
+import os
+
+# Add the project root to sys.path
+# This allows 'from backend import ...' to work when main.py is run directly
+# The project root is the parent directory of the 'backend' directory where this script is located.
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 import asyncio
 import json
-import logging      # Added for logging configuration
-import os           # Required for file operations (delete)
+import logging  # Added for logging configuration
+import os  # Required for file operations (delete)
 import shutil
-import traceback    # To debug and print full tracebacks
+import tempfile  # Added missing import
+import traceback  # To debug and print full tracebacks
 import uuid
-from datetime import datetime
-from typing import Optional, List, Dict, Any # Added Dict, Any
 from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path  # Added for Path type hint
+from typing import Any, Dict, List, Literal, Optional, Tuple  # Added Dict, Any, Literal, Tuple
+
 from fastapi import (
-    FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Depends, Form, Response, status
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,  # Added Query
+    Response,
+    status,
+    UploadFile,
 )
-from fastapi.responses import FileResponse, StreamingResponse, JSONResponse # Added JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from sqlmodel import Session, SQLModel, select
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,  # Added JSONResponse
+    StreamingResponse,
+)
+from sqlmodel import Session, SQLModel, select  # Ensure select is imported
 
 # --- Database Imports ---
-from database import create_db_and_tables, get_session, PcapSession, AsyncJob, engine # Added AsyncJob
+from database import AsyncJob, PcapSession, create_db_and_tables, engine, get_session  # Added AsyncJob, engine
 
-# --- Anonymizer Imports (Existing PCAP functionality) ---
-try:
-    from anonymizer import (
-        save_rules,
-        generate_preview,
-        apply_anonymization,
-        get_subnets,
-        apply_anonymization_response,
-        JobCancelledException as AnonymizerJobCancelledException # Import with alias
-    )
-except ImportError as e:
-     print(f"WARNING: Could not import 'anonymizer' or 'JobCancelledException'. Anonymization/cancellation functionality may not be available. Error: {e}")
-     # Define dummy functions/exceptions if needed
-     AnonymizerJobCancelledException = type('AnonymizerJobCancelledException', (Exception,), {})
-     def apply_anonymization(session_id: str, progress_callback=None, check_stop_requested=None):
-         raise ImportError("The module 'anonymizer' is not available or failed to import.")
-     # Define other dummies if necessary
+# --- Storage Import ---
+from backend import storage  # Import the refactored storage module
+
+# --- Basic Logging Configuration ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# --- Central Exception Import ---
+from backend.exceptions import JobCancelledException
+
+logger.info(
+    "Successfully imported JobCancelledException from backend.exceptions in main.py"
+)
+
+# --- Anonymizer Imports (Existing IP/MAC functionality & New DICOM V2) ---
+from backend.anonymizer import (  # Use absolute import
+    apply_anonymization,
+    # apply_anonymization_response, # This model seems unused, consider removing if confirmed
+    generate_preview,
+    get_subnets,
+    save_rules,
+)
+
+logger.info("Successfully imported functions from backend.anonymizer")
+
+
+# --- DICOM V2 Anonymizer Import ---
+from DicomAnonymizer import anonymize_dicom_v2, extract_dicom_metadata # Assuming this is in project root or PYTHONPATH
 
 # --- DICOM PCAP Extractor Import ---
-try:
-    # Attempt to import the main function and the custom exception
-    from dicom_pcap_extractor import extract_dicom_metadata_from_pcap, JobCancelledException
-except ImportError as e:
-    print(f"WARNING: Could not import 'dicom_pcap_extractor' or 'JobCancelledException'. DICOM PCAP extraction/cancellation functionality may not be available. Error: {e}")
-    # Define dummy functions/exceptions to prevent FastAPI startup errors
-    JobCancelledException = type('JobCancelledException', (Exception,), {}) # Dummy exception
-    # This dummy function will raise an error if the endpoint is actually called.
-    def extract_dicom_metadata_from_pcap(session_id: str):
-        raise ImportError("The module 'dicom_pcap_extractor' is not available or failed to import.")
+from backend.dicom_pcap_extractor import extract_dicom_metadata_from_pcap
+
+logger.info("Successfully imported extract_dicom_metadata_from_pcap from backend.dicom_pcap_extractor")
+
 
 # --- Pydantic Models ---
-# It's recommended to move these new DICOM-related models to models.py
-from pydantic import BaseModel, Field # Ensure BaseModel/Field are imported
-# Assuming these are moved to models.py:
-# Import the new aggregated models and the update payload model
-from models import RuleInput, AggregatedDicomResponse, DicomMetadataUpdatePayload
-# Import the new PcapSessionResponse model
-from models import RuleInput, AggregatedDicomResponse, DicomMetadataUpdatePayload, PcapSessionResponse
-# If you prefer to keep them here, uncomment the definitions below and remove the import from models
-"""
-class AggregatedDicomInfo(BaseModel): # Example if kept here
-    client_ip: str
-    server_ip: str
-    server_ports: List[int]
-    # ... include all fields from DicomExtractedMetadata ...
-    CallingAE: Optional[str] = None
-    # ... etc ...
+from pydantic import BaseModel, Field
+from models import (
+    AggregatedDicomResponse,
+    DicomMetadataUpdatePayload,
+    IpMacPair, # Import IpMacPair directly
+    # IpMacPairListResponse, # Temporarily commented out
+    MacRule,
+    MacRuleInput,
+    MacSettings,
+    MacSettingsUpdate,
+    PcapSessionResponse,
+    RuleInput,
+)
 
-class AggregatedDicomResponse(BaseModel):
-    results: Dict[str, AggregatedDicomInfo]
+# --- MAC Anonymizer Imports ---
+from backend.MacAnonymizer import (
+    apply_mac_transformation,
+    download_oui_csv,
+    extract_ip_mac_pairs,
+    load_mac_settings,
+    MAC_SETTINGS_PATH, # May need to be re-evaluated if settings are per-session or global
+    OUI_CSV_PATH,      # May need to be re-evaluated
+    parse_oui_csv,
+    save_mac_settings as save_mac_settings_global, # Renamed to avoid conflict if a per-session save is needed
+    validate_oui_csv,
+    # parse_oui_csv, # Already imported above
+    # OUI_CSV_PATH, # Already imported above
+)
 
-class DicomMetadataUpdatePayload(BaseModel):
-    # ... include all fields from DicomExtractedMetadata ...
-    CallingAE: Optional[str] = None
-    # ... etc ...
-    Manufacturer: Optional[str] = None
-    ManufacturerModelName: Optional[str] = Field(None, alias="ManufacturerModelName")
-    DeviceSerialNumber: Optional[str] = None
-    SoftwareVersions: Optional[List[str]] = None
-    TransducerType: Optional[str] = None
+logger.info("Successfully imported functions from backend.MacAnonymizer")
 
-class DicomCommunicationInfo(BaseModel):
-    source_ip: str
-    source_port: int
-    dest_ip: str
-    dest_port: int
-    metadata: DicomExtractedMetadata
-
-class DicomExtractionResponse(BaseModel):
-    results: Dict[str, List[DicomCommunicationInfo]]
-"""
 
 # --- Constants ---
-SESSION_DIR = './sessions'
-os.makedirs(SESSION_DIR, exist_ok=True)
+RESOURCES_DIR = os.path.join(os.path.dirname(__file__), "resources")
+os.makedirs(RESOURCES_DIR, exist_ok=True)
 
-# --- Global State (for async jobs) ---
-# REMOVED: Global 'jobs' dictionary. State is now in the AsyncJob table.
-# jobs: Dict[str, Dict[str, Any]] = {}
+# --- Helper Function to Validate Session and File Existence ---
+async def validate_session_and_file(
+    session_id: str,
+    pcap_filename: str, # Logical filename, e.g., "capture.pcap" or "anonymized.pcap"
+    db_session: Session
+) -> Tuple[PcapSession, Path]:
+    """
+    Validates that a PcapSession exists for the given ID and that the specified
+    PCAP file exists within that session's directory.
 
-# --- Pydantic/SQLModel Models (Existing & New) ---
+    Returns the PcapSession record and the validated Path object to the file.
+    Raises HTTPException (404) if the session or file is not found.
+    """
+    logger.debug(f"Validating session ID: {session_id}, filename: {pcap_filename}")
+
+    pcap_session_record = db_session.get(PcapSession, session_id)
+    if not pcap_session_record:
+        logger.error(f"PcapSession record not found for ID: {session_id}")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session (trace) with ID '{session_id}' not found."
+        )
+
+    try:
+        # Directly use the session_id to get the file path
+        validated_pcap_path = storage.get_session_filepath(session_id, pcap_filename)
+    except ValueError as e: # Catch potential errors from storage layer (e.g., invalid filename)
+        logger.error(f"ValueError in storage.get_session_filepath for session_id {session_id}, filename {pcap_filename}: {e}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e: # Catch other unexpected storage errors
+        logger.error(f"Unexpected error getting filepath for session {session_id}, file {pcap_filename}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal error accessing session file path.")
+
+
+    if not validated_pcap_path.exists() or not validated_pcap_path.is_file():
+        logger.error(f"PCAP file '{pcap_filename}' not found at expected path: {validated_pcap_path} for session ID {session_id}")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Input PCAP file '{pcap_filename}' not found for session '{pcap_session_record.name}' (ID: {session_id}). Please ensure the file exists in the correct session directory."
+        )
+
+    logger.info(f"Validated session {session_id} and file path {validated_pcap_path}")
+    # Return the PcapSession record and the validated Path object
+    return pcap_session_record, validated_pcap_path
+
+
+# Define allowed job types
+JobType = Literal[
+    "transform",            # IP/MAC anonymization
+    "dicom_extract",
+    "dicom_anonymize_v2",
+    "dicom_metadata_review", # Placeholder, not fully implemented
+    "mac_oui_update",
+    "mac_transform",
+]
 
 # Response model for listing jobs
 class JobListResponse(BaseModel):
     id: int
     session_id: str
-    trace_name: Optional[str] = None # Added trace name from PcapSession
-    job_type: str
+    trace_name: Optional[str] = None
+    job_type: JobType
     status: str
     progress: int
     created_at: datetime
     updated_at: Optional[datetime] = None
     error_message: Optional[str] = None
+    output_trace_id: Optional[str] = None
 
-# Response model for a single job's status (similar to JobListResponse but includes result_data)
+# Response model for a single job's status
 class JobStatusResponse(JobListResponse):
-     result_data: Optional[Dict] = None # Include potential DICOM result
-
+    result_data: Optional[Dict] = None
 
 class SessionInput(BaseModel):
     session_id: str
 
-# Model for updating session name/description via PUT request
 class PcapSessionUpdate(SQLModel):
     name: Optional[str] = None
     description: Optional[str] = None
 
-
 # --- Lifespan Manager ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Handles application startup and shutdown events."""
-    print("FastAPI application starting up...")
-
-    # Configure SQLAlchemy logger to be less verbose
-    logging.getLogger('sqlalchemy.engine').setLevel(logging.WARNING)
-    print("SQLAlchemy engine logging level set to WARNING.")
-
-    create_db_and_tables() # Create database tables if they don't exist
-
-    # --- Handle stale jobs on startup ---
-    print("Checking for stale 'running' jobs from previous runs...")
+    logger.info("FastAPI application starting up...")
+    logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+    logger.info("SQLAlchemy engine logging level set to WARNING.")
+    create_db_and_tables()
+    logger.info("Checking for stale 'running' jobs from previous runs...")
     try:
         with Session(engine) as startup_session:
-            stale_jobs_statement = select(AsyncJob).where(AsyncJob.status == 'running')
+            stale_jobs_statement = select(AsyncJob).where(AsyncJob.status == "running")
             stale_jobs = startup_session.exec(stale_jobs_statement).all()
             if stale_jobs:
-                print(f"Found {len(stale_jobs)} stale 'running' jobs. Marking as 'failed'.")
+                logger.info(f"Found {len(stale_jobs)} stale 'running' jobs. Marking as 'failed'.")
                 for job in stale_jobs:
-                    job.status = 'failed'
-                    job.error_message = 'Job interrupted due to backend restart.'
+                    job.status = "failed"
+                    job.error_message = "Job interrupted due to backend restart."
                     job.updated_at = datetime.utcnow()
                     startup_session.add(job)
                 startup_session.commit()
-                print("Stale jobs marked as 'failed'.")
+                logger.info("Stale jobs marked as 'failed'.")
             else:
-                print("No stale 'running' jobs found.")
+                logger.info("No stale 'running' jobs found.")
     except Exception as e:
-        print(f"ERROR: Could not check/update stale jobs during startup: {e}")
-        traceback.print_exc()
-    # --- End stale job handling ---
-
-    yield # Application runs here
-    print("FastAPI application shutting down...")
+        logger.error(f"ERROR: Could not check/update stale jobs during startup: {e}")
+        logger.exception("Exception detail during startup job check:")
+    yield
+    logger.info("FastAPI application shutting down...")
 
 # --- FastAPI Application ---
 app = FastAPI(lifespan=lifespan)
 
-# --- CORS Middleware ---
-# Allows requests from your frontend (adjust origin if needed)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"], # Or specific frontend origin
+    allow_origins=["http://localhost:5173"],
     allow_credentials=True,
-    allow_methods=["*"], # Allows all methods (GET, POST, PUT, DELETE, etc.)
-    allow_headers=["*"], # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # --- API Endpoints ---
 
-# --- /upload Endpoint (Existing - Modified for DB) ---
 @app.post("/upload", response_model=PcapSession)
 async def upload(
     name: str = Form(...),
-    description: Optional[str] = Form(None),
     file: UploadFile = File(...),
-    db_session: Session = Depends(get_session)
+    description: Optional[str] = Form(None),
+    db_session: Session = Depends(get_session),
 ):
-    """Handles PCAP file upload, saves file, creates DB record, returns session info."""
-    session_id = str(uuid.uuid4())
-    # Store filenames consistently, maybe using session_id
-    # Ensure filenames are safe (e.g., avoid path traversal if original_filename is used directly)
+    session_id = storage.create_new_session_id()
     safe_original_filename = os.path.basename(file.filename or "unknown.pcap")
-    pcap_filename = f"{session_id}.pcap" # Use session_id for the stored pcap name
-    pcap_path = os.path.join(SESSION_DIR, pcap_filename)
-    rules_filename = f"{session_id}_rules.json" # Corresponding rules file name
-    rules_path = os.path.join(SESSION_DIR, rules_filename) # Path for rules file
-
-    print(f"Processing upload for new session: {session_id}, name: {name}")
-    print(f"Attempting to save uploaded file to: {os.path.abspath(pcap_path)}")
-
-    # 1. Save uploaded PCAP file
+    logger.info(f"Processing upload for new session: {session_id}, name: {name}")
     try:
-        with open(pcap_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        print(f"SUCCESS: File successfully saved to: {pcap_path}")
+        pcap_path_obj = storage.store_uploaded_pcap(session_id, file, "capture.pcap")
+        pcap_path = str(pcap_path_obj)
+        logger.info(f"SUCCESS: File successfully saved to: {pcap_path}")
     except Exception as e:
-        print(f"ERROR: Failed to save file to {pcap_path}. Error: {e}")
+        logger.error(f"ERROR: Failed to save uploaded file for session {session_id}. Error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {e}")
-    finally:
-        await file.close() # Ensure the file handle is closed
 
-    # 2. Create PcapSession database object
-    upload_time = datetime.utcnow() # Use UTC time
+    rules_path_obj = storage.get_session_filepath(session_id, "rules.json")
+    rules_path = str(rules_path_obj)
+    upload_time = datetime.utcnow()
     db_pcap_session = PcapSession(
-        id=session_id,
-        name=name,
-        description=description,
-        original_filename=safe_original_filename, # Store the original filename safely
-        upload_timestamp=upload_time,
-        pcap_path=pcap_path, # Store path to the saved pcap
-        rules_path=rules_path, # Store path where rules *will* be saved
-        updated_at=upload_time # Initial updated_at timestamp
+        id=session_id, name=name, description=description,
+        original_filename=safe_original_filename, upload_timestamp=upload_time,
+        pcap_path=pcap_path, rules_path=rules_path, updated_at=upload_time,
     )
-
-    # 3. Save the session metadata to the database
     db_session.add(db_pcap_session)
     try:
-        db_session.commit() # Commit the transaction
-        db_session.refresh(db_pcap_session) # Refresh to get any DB-generated values
-        print(f"SUCCESS: Session metadata saved to DB for ID: {session_id}")
+        db_session.commit()
+        db_session.refresh(db_pcap_session)
+        logger.info(f"SUCCESS: Session metadata saved to DB for ID: {session_id}")
     except Exception as e:
-        db_session.rollback() # Rollback transaction on error
-        # Attempt to clean up the saved file if DB commit fails
+        db_session.rollback()
         try:
             if os.path.exists(pcap_path): os.remove(pcap_path)
         except OSError as rm_err:
-            print(f"Warning: Failed to clean up file {pcap_path} after DB error: {rm_err}")
-        print(f"Database commit failed for session {session_id}: {e}")
+            logger.warning(f"Warning: Failed to clean up file {pcap_path} after DB error: {rm_err}")
+        logger.error(f"Database commit failed for session {session_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to save session metadata: {e}")
-
-    # 4. Optional: Initialize empty rules using the old storage mechanism (for backward compatibility?)
-    # Consider if this is still needed if rules are fully managed via the API/DB later.
     try:
-        from storage import store # Assuming storage.py still exists
-        store(session_id, 'rules', []) # Store empty list as initial rules
+        storage.store_rules(session_id, [])
     except Exception as e:
-        # Log warning, but don't fail the upload if this part errors
-        print(f"Warning: Failed to create initial empty rules file for {session_id} using storage.py: {e}")
-
-    # 5. Return the created session data (as validated by the PcapSession model)
+        logger.warning(f"Warning: Failed to create initial empty rules file for {session_id}: {e}")
     return db_pcap_session
 
-
-# --- GET /sessions Endpoint (Updated) ---
-# Use the new PcapSessionResponse model for the response
 @app.get("/sessions", response_model=List[PcapSessionResponse])
-async def list_sessions(
-    db_session: Session = Depends(get_session)
-):
-    """Retrieve a list of all saved PCAP sessions from the database."""
-    print("Request received for GET /sessions")
+async def list_sessions_endpoint(db_session: Session = Depends(get_session)): # Renamed for clarity
+    logger.info("Request received for GET /sessions")
+    all_pcap_responses: List[PcapSessionResponse] = []
     try:
-        # Select all PcapSession records, order by upload time descending
-        statement = select(PcapSession).order_by(PcapSession.upload_timestamp.desc())
-        sessions = db_session.exec(statement).all()
-        print(f"Found {len(sessions)} sessions in the database.")
-        return sessions
-    except Exception as e:
-        print(f"Error fetching sessions from database: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve sessions: {e}")
+        pcap_session_statement = select(PcapSession).order_by(PcapSession.upload_timestamp.desc())
+        db_pcap_sessions = db_session.exec(pcap_session_statement).all()
+        logger.info(f"Found {len(db_pcap_sessions)} PcapSession records.")
+        for session in db_pcap_sessions:
+            file_type_for_response = "original"
+            derived_from_session_id_for_response = None
+            source_job_id_for_response = None
+            if session.async_job_id:
+                source_job_id_for_response = session.async_job_id
+                derived_from_session_id_for_response = session.original_session_id
+                job = db_session.get(AsyncJob, session.async_job_id)
+                if job:
+                    if job.job_type == "transform": file_type_for_response = "ip_mac_anonymized"
+                    elif job.job_type == "mac_transform": file_type_for_response = "mac_transformed"
+                    elif job.job_type == "dicom_anonymize_v2": file_type_for_response = "dicom_v2_anonymized"
+                    else:
+                        logger.warning(f"Unmapped job_type '{job.job_type}' for PcapSession {session.id}. Defaulting to 'derived'.")
+                        file_type_for_response = "derived"
+                else:
+                    logger.warning(f"PcapSession {session.id} has async_job_id {session.async_job_id} but job not found. Defaulting to 'derived_job_info_missing'.")
+                    file_type_for_response = "derived_job_info_missing"
+            
+            actual_pcap_filename = os.path.basename(session.pcap_path) if session.pcap_path else session.original_filename
+            # If it's a derived trace and pcap_path is just the original session ID (old bug), try to infer filename
+            if session.original_session_id and session.pcap_path == session.original_session_id:
+                 # This logic might need refinement based on how derived filenames are stored/named
+                if file_type_for_response == "ip_mac_anonymized": actual_pcap_filename = "anonymized_capture.pcap" # Example
+                elif file_type_for_response == "mac_transformed": actual_pcap_filename = "mac_transformed.pcap" # Example
+                elif file_type_for_response == "dicom_v2_anonymized": actual_pcap_filename = "dicom_anonymized_v2.pcap" # Example
 
-# --- PUT /sessions/{session_id} Endpoint (Existing) ---
+
+            response_item = PcapSessionResponse(
+                id=session.id, name=session.name, description=session.description,
+                original_filename=session.original_filename, upload_timestamp=session.upload_timestamp,
+                # pcap_path=session.pcap_path, rules_path=session.rules_path, # Internal paths omitted from response
+                updated_at=session.updated_at, is_transformed=session.is_transformed,
+                original_session_id=session.original_session_id, async_job_id=session.async_job_id,
+                file_type=file_type_for_response,
+                derived_from_session_id=derived_from_session_id_for_response,
+                source_job_id=source_job_id_for_response,
+                actual_pcap_filename=actual_pcap_filename,
+            )
+            all_pcap_responses.append(response_item)
+        all_pcap_responses.sort(key=lambda x: x.upload_timestamp, reverse=True)
+        logger.info(f"Returning {len(all_pcap_responses)} file entries.")
+        return all_pcap_responses
+    except Exception as e:
+        logger.error(f"Error fetching sessions: {e}")
+        logger.exception("Exception detail during /sessions fetch:")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve file list: {e}")
+
 @app.put("/sessions/{session_id}", response_model=PcapSession)
 async def update_session(
-    session_id: str,
-    session_update: PcapSessionUpdate, # Use the specific update model
-    db_session: Session = Depends(get_session)
+    session_id: str, session_update: PcapSessionUpdate, db_session: Session = Depends(get_session)
 ):
-    """Updates the name and/or description of a specific PCAP session."""
-    print(f"Request received for PUT /sessions/{session_id}")
-    # 1. Fetch the existing session record from the DB
+    logger.info(f"Request received for PUT /sessions/{session_id}")
     db_pcap_session = db_session.get(PcapSession, session_id)
     if not db_pcap_session:
-        # Session not found, return 404
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
-
-    # 2. Get updated data from request body, excluding fields not explicitly set by client
     update_data = session_update.model_dump(exclude_unset=True)
     if not update_data:
-        # No data provided for update, return 400 Bad Request
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No update data provided")
-
-    print(f"Updating session {session_id} with data: {update_data}")
-    # 3. Update the fields on the fetched session object
+    logger.info(f"Updating session {session_id} with data: {update_data}")
     needs_update = False
     for key, value in update_data.items():
-        if hasattr(db_pcap_session, key): # Check if the attribute exists on the model
+        if hasattr(db_pcap_session, key):
             setattr(db_pcap_session, key, value)
-            needs_update = True # Mark that at least one field was updated
-
-    # 4. Update the 'updated_at' timestamp if any changes were made
+            needs_update = True
     if needs_update:
-        db_pcap_session.updated_at = datetime.utcnow() # Update timestamp
-
-        # 5. Add the updated object to the session, commit, and refresh
-        db_session.add(db_pcap_session) # Add modifies the existing object in the session
+        db_pcap_session.updated_at = datetime.utcnow()
+        db_session.add(db_pcap_session)
         try:
-            db_session.commit() # Commit the transaction
-            db_session.refresh(db_pcap_session) # Refresh object state from DB
-            print(f"Session {session_id} updated successfully.")
+            db_session.commit()
+            db_session.refresh(db_pcap_session)
+            logger.info(f"Session {session_id} updated successfully.")
         except Exception as e:
-            db_session.rollback() # Rollback on commit error
-            print(f"Database commit failed during update for session {session_id}: {e}")
+            db_session.rollback()
+            logger.error(f"Database commit failed for session {session_id}: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to update session metadata: {e}")
-
-    # 6. Return the (potentially updated) session object
     return db_pcap_session
 
-
-# --- DELETE /sessions/{session_id} Endpoint (Existing) ---
-@app.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT) # Use 204 status code
-async def delete_session(
-    session_id: str,
-    db_session: Session = Depends(get_session)
-):
-    """Deletes a PCAP session record and its associated files."""
-    print(f"Request received for DELETE /sessions/{session_id}")
-    # 1. Fetch the session record to get file paths
+@app.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_session(session_id: str, db_session: Session = Depends(get_session)):
+    logger.info(f"Request received for DELETE /sessions/{session_id}")
     pcap_session = db_session.get(PcapSession, session_id)
     if not pcap_session:
-        # Session not found, return 404
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+    try:
+        # Determine the physical directory to delete.
+        # If it's a derived trace, its record might point to files in original_session_id's dir.
+        # However, the PcapSession record being deleted is 'session_id'.
+        # If 'session_id' is an original trace, its directory is 'session_id'.
+        # If 'session_id' is a derived trace, it doesn't have its own physical directory.
+        # Deleting a derived trace record should NOT delete the original's directory.
+        # Only delete directory if pcap_session.original_session_id is None (it's an original trace)
+        if pcap_session.original_session_id is None:
+            session_dir_path = storage.get_session_dir(session_id)
+            if session_dir_path.exists() and session_dir_path.is_dir():
+                shutil.rmtree(session_dir_path)
+                logger.info(f"Deleted session directory: {str(session_dir_path)} for original trace {session_id}")
+            else:
+                logger.warning(f"Session directory not found or not a directory for original trace {session_id}: {str(session_dir_path)}")
+        else:
+            logger.info(f"Session {session_id} is a derived trace. Its database record will be deleted, but no physical directory will be removed as its files reside in {pcap_session.original_session_id}'s directory.")
 
-    # 2. Define paths for files associated with the session
-    # Use paths stored in the database record for accuracy
-    files_to_delete = [
-        pcap_session.pcap_path, # Original PCAP file
-        pcap_session.rules_path, # Rules JSON file
-        # Construct path for potentially generated anonymized file
-        os.path.join(SESSION_DIR, f"{session_id}_anon.pcap")
-    ]
-    # Attempt to delete each associated file
-    for file_path in files_to_delete:
-        if file_path and os.path.exists(file_path): # Check if path is valid and file exists
-            try:
-                os.remove(file_path)
-                print(f"Deleted file: {file_path}")
-            except OSError as e:
-                # Log error but continue to delete DB record even if file deletion fails
-                print(f"Warning: Failed to delete file {file_path}. Error: {e}")
+    except Exception as e:
+        logger.warning(f"Warning during directory handling for session {session_id}. Error: {e}")
+        logger.exception(f"Exception during session directory deletion for {session_id}:")
 
-    # 3. Delete the database record
+    # Delete related AsyncJob if it produced this session
+    if pcap_session.async_job_id:
+        job_to_delete = db_session.get(AsyncJob, pcap_session.async_job_id)
+        if job_to_delete and job_to_delete.output_trace_id == session_id:
+            # Potentially delete the job too, or just nullify its output_trace_id
+            # For now, let's just log. Deleting jobs might be a separate concern.
+            logger.info(f"Session {session_id} was an output of job {pcap_session.async_job_id}. Consider job cleanup if necessary.")
+
     db_session.delete(pcap_session)
     try:
-        db_session.commit() # Commit the deletion
-        print(f"Session {session_id} deleted successfully from database.")
-        # For 204 No Content, return None or Response(status_code=204)
-        return None
+        db_session.commit()
+        logger.info(f"PcapSession record {session_id} deleted successfully from database.")
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
     except Exception as e:
-        # This might happen if there are constraints or other DB issues
-        db_session.rollback() # Rollback on error
-        print(f"Database error during session deletion commit for {session_id}: {e}")
-        # Use 500 Internal Server Error if commit fails
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error deleting session from database: {e}")
+        db_session.rollback()
+        logger.error(f"Database commit failed for deleting PcapSession record {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete session from database: {e}")
+
+# --- Background Task Definitions ---
+
+async def run_apply_anonymization(
+    job_id: int,
+    input_session_id: str, # Renamed for clarity - this is the ID of the trace to read from
+    input_pcap_filename: str, # Filename within that directory
+):
+    with Session(engine) as db_session:
+        job = db_session.get(AsyncJob, job_id)
+        if not job:
+            logger.error(f"Job {job_id} not found for IP/MAC anonymization task.")
+            return
+
+        if job.status == "cancelling" or job.stop_requested:
+            job.status = "cancelled"
+            job.error_message = "Cancelled before start."
+            job.updated_at = datetime.utcnow()
+            db_session.add(job)
+            db_session.commit()
+            logger.info(f"Job {job_id} (IP/MAC Anonymization) cancelled before start.")
+            return
+
+        job.status = "running"
+        job.progress = 0 # Initialize progress
+        job.updated_at = datetime.utcnow()
+        db_session.add(job)
+        db_session.commit()
+        logger.info(f"Job {job_id} (IP/MAC Anonymization) for input session {input_session_id}, file '{input_pcap_filename}' started.")
+
+        # Define callbacks for anonymizer
+        def progress_callback(progress_percentage: int):
+            with Session(engine) as cb_session: # Use a new session for thread safety if anonymizer runs in a separate thread
+                cb_job = cb_session.get(AsyncJob, job_id)
+                if cb_job:
+                    cb_job.progress = progress_percentage
+                    cb_job.updated_at = datetime.utcnow()
+                    cb_session.add(cb_job)
+                    cb_session.commit()
+                    logger.debug(f"Job {job_id} progress: {progress_percentage}%")
+
+        def check_stop_requested() -> bool:
+            with Session(engine) as cb_session:
+                cb_job = cb_session.get(AsyncJob, job_id)
+                if cb_job and (cb_job.stop_requested or cb_job.status == "cancelling"):
+                    logger.info(f"Stop request detected for job {job_id} by check_stop_requested.")
+                    return True
+                return False
+
+        new_output_trace_id = storage.create_new_session_id()
+        output_pcap_filename = f"anonymized_ip_mac_{new_output_trace_id[:8]}.pcap" # Example filename
+
+        try:
+            # Call the synchronous anonymizer.apply_anonymization without await
+            # It will create the output directory if it doesn't exist via storage.write_pcap_to_session
+            anonymization_result = apply_anonymization(
+                input_trace_id=input_session_id, # Use the input session ID for reading
+                input_pcap_filename=input_pcap_filename,
+                new_output_trace_id=new_output_trace_id, # Pass the new ID for the output directory/trace
+                output_pcap_filename=output_pcap_filename,
+                progress_callback=progress_callback,
+                check_stop_requested=check_stop_requested
+            )
+
+            # Create a new PcapSession record for the anonymized output
+            original_session_record = db_session.get(PcapSession, input_session_id) # Get original to copy name etc.
+            original_session_name = original_session_record.name if original_session_record else "Unknown Original"
+
+            new_pcap_session = PcapSession(
+                id=new_output_trace_id, # Use the ID from anonymization_result which should match new_output_trace_id
+                name=f"IP/MAC Anonymized - {original_session_name}",
+                description=f"Derived from '{original_session_name}' (ID: {input_session_id}) by IP/MAC anonymization job {job_id}.",
+                original_filename=output_pcap_filename, # The name of the file within its session dir
+                upload_timestamp=datetime.utcnow(),
+                pcap_path=str(anonymization_result["full_output_path"]), # Full path to the new pcap
+                rules_path=str(storage.get_session_filepath(new_output_trace_id, "rules.json")), # Path for potential rules copy
+                updated_at=datetime.utcnow(),
+                is_transformed=True,
+                original_session_id=input_session_id, # Link to the original session
+                async_job_id=job_id
+            )
+            db_session.add(new_pcap_session)
+
+            # Optionally, copy rules from original session to new session
+            try:
+                original_rules_path = storage.get_session_filepath(input_session_id, "rules.json")
+                if original_rules_path.exists():
+                    new_rules_path = storage.get_session_filepath(new_output_trace_id, "rules.json")
+                    # Ensure target directory exists (storage.write_pcap_to_session should have made new_output_trace_id dir)
+                    new_rules_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(original_rules_path, new_rules_path)
+                    logger.info(f"Copied rules from {input_session_id} to new session {new_output_trace_id}")
+            except Exception as copy_err:
+                logger.warning(f"Could not copy rules for job {job_id} from {input_session_id} to {new_output_trace_id}: {copy_err}")
 
 
-# --- Endpoints related to PCAP Anonymization (Existing - Needs Review/Update) ---
-# TODO: Review if these endpoints should be updated to primarily use DB storage
-#       instead of relying solely on storage.py and session_id file conventions.
+            job.status = "completed"
+            job.progress = 100
+            job.output_trace_id = new_pcap_session.id
+            logger.info(f"Job {job_id} (IP/MAC Anonymization) completed. Output trace ID: {new_pcap_session.id}")
+
+        except JobCancelledException:
+            job.status = "cancelled"
+            job.error_message = "Job execution was cancelled by user."
+            logger.info(f"Job {job_id} (IP/MAC Anonymization) was cancelled during execution.")
+        except FileNotFoundError as e:
+            job.status = "failed"
+            job.error_message = f"File not found during IP/MAC anonymization: {e}"
+            logger.error(f"Job {job_id} (IP/MAC Anonymization) failed for input {input_session_id}: {e}", exc_info=True)
+        except Exception as e:
+            job.status = "failed"
+            job.error_message = f"An unexpected error occurred during IP/MAC anonymization: {str(e)}"
+            logger.error(f"Job {job_id} (IP/MAC Anonymization) failed for input {input_session_id}: {e}", exc_info=True)
+            # traceback.print_exc() # For more detailed console logging during debug
+        finally:
+            job.updated_at = datetime.utcnow()
+            db_session.add(job)
+            db_session.commit()
+
+async def run_mac_transform(
+    job_id: int,
+    input_session_id: str, # Renamed for clarity
+    input_pcap_filename: str, # Renamed for clarity
+):
+    with Session(engine) as db_session:
+        job = db_session.get(AsyncJob, job_id)
+        if not job: logger.error(f"Job {job_id} not found."); return
+        if job.status == "cancelling":
+            job.status = "cancelled"; job.error_message = "Cancelled before start."; job.updated_at = datetime.utcnow()
+            db_session.add(job); db_session.commit(); logger.info(f"Job {job_id} cancelled before start."); return
+        job.status = "running"; job.updated_at = datetime.utcnow(); db_session.add(job); db_session.commit()
+        logger.info(f"Job {job_id} (MAC Transform) for input session {input_session_id}, file {input_pcap_filename} started.")
+        try:
+            # apply_mac_transformation needs to be updated to accept input_trace_id, new_output_trace_id etc.
+            # For now, assuming it's called correctly internally or we adapt the call here.
+            # Let's assume apply_mac_transformation is adapted or we create a wrapper.
+            # Placeholder: Assume apply_mac_transformation handles creating the new trace ID and saving.
+            # It should return the new PcapSession record.
+            # We need to generate the new ID here to pass it.
+            new_output_trace_id = storage.create_new_session_id()
+            output_pcap_filename = f"mac_transformed_{new_output_trace_id[:8]}.pcap" # Example filename
+
+            # TODO: Adapt the call to apply_mac_transformation or the function itself
+            # Assuming apply_mac_transformation is adapted like apply_anonymization:
+            mac_transform_result = apply_mac_transformation( # This function needs adaptation
+                input_trace_id=input_session_id,
+            input_pcap_filename=input_pcap_filename,
+            new_output_trace_id=new_output_trace_id,
+            output_pcap_filename=output_pcap_filename,
+            # Pass callbacks if apply_mac_transformation supports them
+            # progress_callback=progress_callback, # TODO: Implement progress/cancel in apply_mac_transformation if needed
+            # check_stop_requested=check_stop_requested
+        )
+
+        # Create PcapSession record after transformation is successful
+            # This part needs clarification based on apply_mac_transformation's actual signature/behavior.
+            # For now, let's assume we need to create it here based on the result dict.
+            original_session_record = db_session.get(PcapSession, input_session_id)
+            original_session_name = original_session_record.name if original_session_record else "Unknown Original"
+
+            new_pcap_session = PcapSession(
+                id=new_output_trace_id,
+                name=f"MAC Transformed - {original_session_name}",
+                description=f"Derived from '{original_session_name}' (ID: {input_session_id}) by MAC transformation job {job_id}.",
+                original_filename=output_pcap_filename,
+                upload_timestamp=datetime.utcnow(),
+                pcap_path=str(mac_transform_result["full_output_path"]),
+                rules_path=str(storage.get_session_filepath(new_output_trace_id, "mac_rules.json")), # Path for potential rules copy
+                updated_at=datetime.utcnow(),
+                is_transformed=True,
+                original_session_id=input_session_id,
+                async_job_id=job_id
+            )
+            db_session.add(new_pcap_session)
+            # Optionally copy mac_rules.json if needed
+
+            job.status = "completed"; job.progress = 100; job.output_trace_id = new_pcap_session.id
+            logger.info(f"Job {job_id} MAC transform completed. Output trace ID: {new_pcap_session.id}")
+        except JobCancelledException:
+            job.status = "cancelled"; job.error_message = "Job execution was cancelled."
+        except FileNotFoundError as e:
+            job.status = "failed"; job.error_message = f"File not found: {e}"
+        except Exception as e:
+            job.status = "failed"; job.error_message = f"Error during MAC transformation: {str(e)}"
+            logger.error(f"Job {job_id} MAC transform failed for input {input_session_id}: {e}", exc_info=True)
+        finally:
+            job.updated_at = datetime.utcnow(); db_session.add(job); db_session.commit()
+
+async def run_dicom_extract(
+    job_id: int,
+    input_session_id: str, # Renamed for clarity
+    input_pcap_filename: str, # Renamed for clarity
+):
+    with Session(engine) as db_session:
+        job = db_session.get(AsyncJob, job_id)
+        if not job: logger.error(f"Job {job_id} not found."); return
+        if job.status == "cancelling":
+            job.status = "cancelled"; job.error_message = "Cancelled before start."; job.updated_at = datetime.utcnow()
+            db_session.add(job); db_session.commit(); logger.info(f"Job {job_id} cancelled before start."); return
+        job.status = "running"; job.updated_at = datetime.utcnow(); db_session.add(job); db_session.commit()
+        logger.info(f"Job {job_id} (DICOM Extract) for input session {input_session_id}, file {input_pcap_filename} started.")
+        try:
+            # extract_dicom_metadata_from_pcap needs the input session ID and filename
+            # It should use storage.read_pcap_from_session(input_session_id, input_pcap_filename) internally
+            # Assuming extract_dicom_metadata_from_pcap is adapted or called correctly.
+            # TODO: Verify/Adapt extract_dicom_metadata_from_pcap if needed.
+            # It should return the result data to be stored in the job.
+            extracted_data = await extract_dicom_metadata_from_pcap(
+                session_id=input_session_id, # Pass the correct input session ID
+                pcap_file_name=input_pcap_filename,
+                job_id=job_id, # For cancellation check
+                db_session=db_session # For job progress updates
+            )
+            job.result_data = extracted_data # Store the result directly in the job
+            job.status = "completed"; job.progress = 100
+            logger.info(f"Job {job_id} DICOM extraction completed.")
+        except JobCancelledException:
+            job.status = "cancelled"; job.error_message = "Job execution was cancelled."
+        except FileNotFoundError as e:
+            job.status = "failed"; job.error_message = f"File not found: {e}"
+        except Exception as e:
+            job.status = "failed"; job.error_message = f"Error during DICOM extraction: {str(e)}"
+            logger.error(f"Job {job_id} DICOM extraction failed for input {input_session_id}: {e}", exc_info=True)
+        finally:
+            job.updated_at = datetime.utcnow(); db_session.add(job); db_session.commit()
+
+async def run_dicom_anonymize_v2(
+    job_id: int,
+    input_session_id: str, # Renamed for clarity
+    input_pcap_filename: str, # Renamed for clarity
+    metadata_overrides_json_string: Optional[str], # JSON string of overrides
+):
+    with Session(engine) as db_session:
+        job = db_session.get(AsyncJob, job_id)
+        if not job: logger.error(f"Job {job_id} not found."); return
+        if job.status == "cancelling":
+            job.status = "cancelled"; job.error_message = "Cancelled before start."; job.updated_at = datetime.utcnow()
+            db_session.add(job); db_session.commit(); logger.info(f"Job {job_id} cancelled before start."); return
+        job.status = "running"; job.updated_at = datetime.utcnow(); db_session.add(job); db_session.commit()
+        logger.info(f"Job {job_id} (DICOM Anonymize V2) for input session {input_session_id}, file {input_pcap_filename} started.")
+
+        metadata_overrides: Optional[Dict[str, DicomMetadataUpdatePayload]] = None
+        if metadata_overrides_json_string:
+            try:
+                overrides_raw = json.loads(metadata_overrides_json_string)
+                metadata_overrides = {k: DicomMetadataUpdatePayload(**v) for k, v in overrides_raw.items()}
+            except json.JSONDecodeError:
+                job.status = "failed"; job.error_message = "Invalid JSON in metadata_overrides."
+                job.updated_at = datetime.utcnow(); db_session.add(job); db_session.commit()
+                logger.error(f"Job {job_id} failed due to invalid metadata_overrides JSON.")
+                return
+        try:
+            # anonymize_dicom_v2 needs input session ID and filename.
+            # It will create a new PcapSession for the output.
+            # TODO: Verify/Adapt anonymize_dicom_v2 if needed.
+            # Assuming it's adapted like apply_anonymization:
+            new_output_trace_id = storage.create_new_session_id()
+            output_pcap_filename = f"dicom_anonymized_v2_{new_output_trace_id[:8]}.pcap" # Example filename
+
+            # Assuming anonymize_dicom_v2 is adapted to take new_output_trace_id etc.
+            # and returns a result dict or the new PcapSession record.
+            # Call anonymize_dicom_v2 (assuming its signature matches the pattern)
+            # It returns device_data, verification_summary, not the PcapSession record
+            device_data, verification_summary = await anonymize_dicom_v2(
+                input_trace_id=input_session_id,
+                input_pcap_filename=input_pcap_filename,
+                new_output_trace_id=new_output_trace_id,
+                output_pcap_filename=output_pcap_filename,
+                metadata_overrides=metadata_overrides, # Pass parsed overrides
+                debug_mode=False, # Add missing argument, default to False
+                # Pass callbacks if supported by anonymize_dicom_v2
+                # progress_callback=progress_callback, # TODO: Implement progress/cancel in anonymize_dicom_v2 if needed
+                # check_stop_requested=check_stop_requested,
+                # db_session=db_session, # Pass session if needed internally by anonymize_dicom_v2
+                # job_id=job_id # Pass job_id if needed internally by anonymize_dicom_v2
+            )
+
+            # Create the PcapSession record for the new trace
+            original_session_record = db_session.get(PcapSession, input_session_id)
+            original_session_name = original_session_record.name if original_session_record else "Unknown Original"
+            output_full_path = storage.get_session_filepath(new_output_trace_id, output_pcap_filename) # Get the full path
+
+            new_pcap_session = PcapSession(
+                id=new_output_trace_id,
+                name=f"DICOM Anonymized V2 - {original_session_name}",
+                description=f"Derived from '{original_session_name}' (ID: {input_session_id}) by DICOM Anonymization V2 job {job_id}.",
+                original_filename=output_pcap_filename,
+                upload_timestamp=datetime.utcnow(),
+                pcap_path=str(output_full_path),
+                rules_path=None, # DICOM V2 doesn't use separate rules files in the same way
+                updated_at=datetime.utcnow(),
+                is_transformed=True,
+                original_session_id=input_session_id,
+                async_job_id=job_id
+            )
+            db_session.add(new_pcap_session)
+            # Optionally store device_data or verification_summary if needed, e.g., in job.result_data
+            # job.result_data = {"devices": device_data, "verification": verification_summary}
+
+            job.status = "completed"; job.progress = 100; job.output_trace_id = new_pcap_session.id
+            logger.info(f"Job {job_id} DICOM Anonymize V2 completed. Output trace ID: {new_pcap_session.id}")
+        except JobCancelledException:
+            job.status = "cancelled"; job.error_message = "Job execution was cancelled."
+        except FileNotFoundError as e:
+            job.status = "failed"; job.error_message = f"File not found: {e}"
+        except Exception as e:
+            job.status = "failed"; job.error_message = f"Error during DICOM Anonymization V2: {str(e)}"
+            logger.error(f"Job {job_id} DICOM Anonymization V2 failed for input {input_session_id}: {e}", exc_info=True)
+        finally:
+            job.updated_at = datetime.utcnow(); db_session.add(job); db_session.commit()
+
+
+# --- IP/MAC Anonymization Endpoints ---
+@app.get("/subnets/{session_id_from_frontend}")
+async def get_subnets_endpoint(
+    session_id_from_frontend: str,
+    db_session: Session = Depends(get_session),
+    pcap_filename: Optional[str] = Query("capture.pcap", description="Logical filename of the PCAP to analyze")
+):
+    logger.info(f"Subnet request for session_id: {session_id_from_frontend}, logical_file: {pcap_filename}")
+    try:
+        # Use the new helper function for validation
+        pcap_session_record, _ = await validate_session_and_file(
+            session_id=session_id_from_frontend,
+            pcap_filename=pcap_filename,
+            db_session=db_session
+        )
+    except HTTPException as e:
+        logger.error(f"Error validating session/file for subnet extraction: {e.detail}")
+        raise e # Propagate 404 or other validation errors
+
+    logger.info(f"Extracting subnets for session {pcap_session_record.name} ({session_id_from_frontend}), file {pcap_filename}.")
+    try:
+        # Call get_subnets directly with the validated session_id
+        subnets = get_subnets(session_id_from_frontend, pcap_filename)
+        return subnets
+    except FileNotFoundError: # Should be caught by validate_session_and_file, but keep as fallback
+        raise HTTPException(status_code=404, detail=f"PCAP file '{pcap_filename}' not found for session '{pcap_session_record.name}'.")
+    except Exception as e:
+        logger.error(f"Error extracting subnets: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to extract subnets: {e}")
 
 @app.put("/rules")
 async def rules_endpoint(input: RuleInput, db_session: Session = Depends(get_session)):
-    """Saves the transformation rules for a given session (currently uses storage.py)."""
-    # Fetch session to verify ID and potentially use DB paths in the future
-    pcap_session = db_session.get(PcapSession, input.session_id)
-    if not pcap_session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    print(f"Saving rules for session {input.session_id} (using storage.py logic).")
-    # Current implementation delegates to the old save_rules function
-    try:
-        return save_rules(input)
-    except Exception as e:
-        print(f"Error calling save_rules for session {input.session_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to save rules: {e}")
+    session_id = input.session_id # Use the ID directly
+    logger.info(f"Request received for PUT /rules for session_id: {session_id}")
 
-@app.get("/preview/{session_id}")
-async def preview_endpoint(session_id: str, db_session: Session = Depends(get_session)):
-    """Generates a preview of the anonymization based on current rules (uses storage.py)."""
-    pcap_session = db_session.get(PcapSession, session_id)
-    if not pcap_session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    print(f"Generating preview for session {session_id} (using storage.py logic).")
-    # Current implementation delegates to generate_preview
+    # Validate the session exists
+    pcap_session_record = db_session.get(PcapSession, session_id)
+    if not pcap_session_record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Session (trace) with ID '{session_id}' not found, cannot save rules.")
+
+    # No need to resolve physical directory ID anymore
+    logger.info(f"Subnet rules for session {session_id} will be saved in its directory.")
     try:
-        # Ensure generate_preview uses pcap_session.pcap_path and rules from storage/DB
-        return generate_preview(session_id) # Assumes generate_preview finds files based on session_id
-    except FileNotFoundError:
-         raise HTTPException(status_code=404, detail="Session data or PCAP file not found for preview.")
+        rules_as_dict_list = [rule.model_dump(by_alias=False) for rule in input.rules]
+        # Call save_rules directly with the session_id
+        result = save_rules(session_id, rules_as_dict_list) # save_rules uses storage.store_rules
+        # Update timestamp of the session
+        pcap_session_record.updated_at = datetime.utcnow()
+        db_session.add(pcap_session_record)
+        db_session.commit()
+        logger.info(f"Updated 'updated_at' for PcapSession {session_id} after saving rules.")
+        return result
     except Exception as e:
-        print(f"Error during preview generation for {session_id}: {e}")
+        db_session.rollback()
+        logger.error(f"Error saving rules for session {session_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to save subnet rules: {e}")
+
+@app.get("/preview/{session_id_from_frontend}")
+async def preview_endpoint(
+    session_id_from_frontend: str,
+    pcap_filename: Optional[str] = Query("capture.pcap", description="Logical filename of PCAP to preview"),
+    db_session: Session = Depends(get_session),
+):
+    logger.info(f"Preview request for session_id: {session_id_from_frontend}, logical_file: {pcap_filename}")
+    try:
+        # Use the new helper function for validation
+        pcap_session_record, validated_pcap_path = await validate_session_and_file(
+            session_id=session_id_from_frontend,
+            pcap_filename=pcap_filename,
+            db_session=db_session
+        )
+    except HTTPException as e:
+        logger.error(f"Error validating session/file for preview: {e.detail}")
+        raise e # Propagate 404 or other validation errors
+
+    logger.info(f"Generating preview for {pcap_session_record.name} ({session_id_from_frontend}), file {validated_pcap_path}.")
+    try:
+        # Call generate_preview directly with the validated session_id and filename
+        preview_data = generate_preview(session_id_from_frontend, pcap_filename)
+        return preview_data
+    except FileNotFoundError: # Should be caught by validate_session_and_file
+        raise HTTPException(status_code=404, detail=f"PCAP file '{pcap_filename}' not found for session '{pcap_session_record.name}'.")
+    except Exception as e:
+        logger.error(f"Error generating preview: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to generate preview: {e}")
 
-
-@app.get("/subnets/{session_id}")
-async def subnets_endpoint(session_id: str, db_session: Session = Depends(get_session)):
-    """Gets the list of detected subnets from the original PCAP (uses storage.py)."""
-    pcap_session = db_session.get(PcapSession, session_id)
-    if not pcap_session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    print(f"Getting subnets for session {session_id} (using storage.py logic).")
-    # Current implementation delegates to get_subnets
-    try:
-         # Ensure get_subnets uses pcap_session.pcap_path
-        return get_subnets(session_id) # Assumes get_subnets finds the file
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Original PCAP file not found for subnet analysis.")
-    except Exception as e:
-        print(f"Error getting subnets for {session_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to analyze subnets: {e}")
-
-
-@app.get("/download/{session_id}")
-async def download_anonymized_pcap(session_id: str, db_session: Session = Depends(get_session)):
-    """Applies anonymization and provides the anonymized PCAP file for download."""
-    pcap_session = db_session.get(PcapSession, session_id)
-    if not pcap_session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    print(f"Request to download anonymized PCAP for session {session_id}.")
-    # Uses apply_anonymization_response which internally calls apply_anonymization
-    try:
-        # apply_anonymization_response should handle file path logic based on session_id
-        return apply_anonymization_response(session_id)
-    except FileNotFoundError:
-        # This could mean original PCAP or rules are missing, or anon file wasn't created
-        print(f"Download failed: Original or anonymized file not found for session {session_id}")
-        raise HTTPException(status_code=404, detail="Original or anonymized file not found.")
-    except Exception as e:
-        print(f"Download failed for session {session_id}: {e}")
-        traceback.print_exc() # Log detailed error
-        raise HTTPException(status_code=500, detail=f"Error preparing file for download: {e}")
-
-# REMOVED: Synchronous /download endpoint. Transformation is now async via /sessions/{id}/transform/start
-
-
-#--- NEW Endpoints for Listing Async Jobs ---
-
-@app.get("/jobs", response_model=List[JobListResponse], tags=["Jobs"])
-async def list_all_jobs(
+@app.post("/apply", response_model=AsyncJob)
+async def apply_endpoint(
+    background_tasks: BackgroundTasks, 
+    session_id_from_frontend: str = Form(..., alias="session_id"),
+    input_pcap_filename: str = Form(...),
     db_session: Session = Depends(get_session)
 ):
-    """Retrieves a list of all asynchronous jobs from the database, including the trace name."""
-    print("Request received for GET /jobs")
+    logger.info(f"Apply IP/MAC anonymization request for session_id: {session_id_from_frontend}, input_pcap_filename: {input_pcap_filename}")
     try:
-        # Join AsyncJob with PcapSession to fetch the session name (trace_name)
-        statement = select(AsyncJob, PcapSession.name).join(
-            PcapSession, AsyncJob.session_id == PcapSession.id
-        ).order_by(AsyncJob.created_at.desc())
-
-        results = db_session.exec(statement).all()
-        print(f"Found {len(results)} jobs with trace names in the database.")
-
-        # Construct the response list, adding trace_name to each job object
-        response_list = []
-        for job, trace_name in results:
-            # Convert the SQLModel job object to a dictionary
-            job_dict = job.model_dump()
-            # Add the fetched trace name to the dictionary
-            job_dict['trace_name'] = trace_name
-            # Create and validate the response object using the Pydantic model
-            response_list.append(JobListResponse(**job_dict))
-
-        return response_list
-    except Exception as e:
-        print(f"Error fetching jobs with trace names from database: {e}")
-        traceback.print_exc() # Log the full traceback for debugging
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve jobs: {e}")
-
-
-@app.get("/jobs/{job_id}", response_model=JobStatusResponse, tags=["Jobs"])
-async def get_job_details(
-    job_id: int,
-    db_session: Session = Depends(get_session)
-):
-    """Retrieves the details and status of a specific asynchronous job."""
-    print(f"Request received for GET /jobs/{job_id}")
-    db_job = db_session.get(AsyncJob, job_id)
-    if not db_job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job with ID {job_id} not found.")
-    print(f"Found job {job_id}: Status={db_job.status}, Progress={db_job.progress}")
-    # Assuming AsyncJob model fields align with JobStatusResponse
-    return db_job
-
-
-# --- NEW Endpoint to Request Job Stop ---
-@app.post("/jobs/{job_id}/stop", status_code=status.HTTP_202_ACCEPTED, tags=["Jobs"])
-async def request_job_stop(
-    job_id: int,
-    db_session: Session = Depends(get_session)
-):
-    """Requests a running or pending job to stop gracefully."""
-    print(f"Request received for POST /jobs/{job_id}/stop")
-    job = db_session.get(AsyncJob, job_id)
-    if not job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job with ID {job_id} not found.")
-
-    # Only allow stopping jobs that are pending or running
-    if job.status not in ['pending', 'running']:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Job {job_id} cannot be stopped because its status is '{job.status}'. Only 'pending' or 'running' jobs can be stopped."
+        # Validate input session and file exist
+        pcap_session_record, _ = await validate_session_and_file(
+            session_id=session_id_from_frontend,
+            pcap_filename=input_pcap_filename,
+            db_session=db_session
         )
+    except HTTPException as e:
+        raise e # Propagate 404 or other validation errors
 
-    if job.stop_requested:
-        print(f"Stop already requested for job {job_id}.")
-        # Return 202 Accepted even if already requested, the request is acknowledged.
-        return {"message": "Stop request already acknowledged."}
+    # Load rules directly from the input session's directory
+    rules = storage.get_rules(session_id_from_frontend)
+    if rules is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Anonymization rules not found for session '{pcap_session_record.name}'. Please define rules first.")
 
-    # Set the flag and potentially update status
-    job.stop_requested = True
-    # Optionally change status to 'cancelling' immediately, or let the task handle it
-    # Let's change it here for immediate feedback via SSE
-    job.status = 'cancelling'
-    job.updated_at = datetime.utcnow()
-    db_session.add(job)
-    try:
-        db_session.commit()
-        print(f"Stop requested successfully for job {job_id}. Status set to 'cancelling'.")
-        return {"message": "Job stop requested successfully."}
-    except Exception as e:
-        db_session.rollback()
-        print(f"Database error while requesting stop for job {job_id}: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to request job stop.")
-
-
-# --- NEW Endpoint to Delete a Job Record ---
-@app.delete("/jobs/{job_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Jobs"])
-async def delete_job_record(
-    job_id: int,
-    db_session: Session = Depends(get_session)
-):
-    """Deletes a specific asynchronous job record from the database."""
-    print(f"Request received for DELETE /jobs/{job_id}")
-    job = db_session.get(AsyncJob, job_id)
-    if not job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job with ID {job_id} not found.")
-
-    # Define allowed statuses for deletion
-    allowed_delete_statuses = ['completed', 'failed', 'cancelled'] # Add 'cancelled'
-    if job.status not in allowed_delete_statuses:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Job {job_id} cannot be deleted because its status is '{job.status}'. Only jobs with status {allowed_delete_statuses} can be deleted."
-        )
-
-    # Delete the job record
-    db_session.delete(job)
-    try:
-        db_session.commit()
-        print(f"Job {job_id} deleted successfully from database.")
-        # Return 204 No Content implicitly by returning None or Response(status_code=204)
-        return None
-    except Exception as e:
-        db_session.rollback()
-        print(f"Database error during job deletion commit for {job_id}: {e}")
-        # Check for specific constraint errors if necessary, otherwise return 500
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error deleting job from database: {e}")
-
-
-#--- REMOVED: Synchronous DICOM Metadata Extraction Endpoint ---
-# The functionality is replaced by the async job endpoints below.
-# @app.get("/dicom/pcap/{session_id}/extract", ...)
-
-
-# --- Background Task Function for DICOM Extraction ---
-def run_dicom_extract(job_id: int, session_id: str): # job_id is now int
-    """Background task function to perform DICOM metadata extraction and update DB, with cancellation support."""
-    print(f"--- TASK START: DICOM Extraction Job {job_id} for Session {session_id} ---")
-
-    # Progress callback function to update the database
-    def update_progress_db(progress_percentage: int):
-        with Session(engine) as progress_session:
-            try:
-                job = progress_session.get(AsyncJob, job_id)
-                if job and job.status == 'running': # Only update if still running
-                    job.progress = max(0, min(100, progress_percentage))
-                    job.updated_at = datetime.utcnow()
-                    progress_session.add(job)
-                    progress_session.commit()
-                    # print(f"DICOM Job {job_id} progress: {progress_percentage}% (DB updated)") # Optional debug log
-                elif job:
-                    print(f"DICOM Job {job_id} no longer running (status: {job.status}), skipping progress update.")
-                else:
-                     print(f"DICOM Job {job_id} not found during progress update.")
-            except Exception as e:
-                progress_session.rollback()
-                print(f"Error updating progress in DB for job {job_id}: {e}")
-            finally:
-                progress_session.close() # Ensure session is closed
-
-    # --- Cancellation Check Function ---
-    # This function will be passed to the extractor to periodically check the DB flag
-    def check_stop_requested_db() -> bool:
-        with Session(engine) as check_session:
-            try:
-                job = check_session.get(AsyncJob, job_id)
-                if job and job.stop_requested:
-                    print(f"--- TASK CHECK: Stop requested flag is TRUE for job {job_id} in DB ---")
-                    return True
-                # print(f"--- TASK CHECK: Stop requested flag is FALSE for job {job_id} in DB ---") # Debug log
-                return False
-            except Exception as e:
-                print(f"Error checking stop_requested flag in DB for job {job_id}: {e}")
-                return False # Default to false if DB check fails, to avoid accidental cancellation
-            finally:
-                check_session.close()
-    # ---------------------------------
-
-    extracted_data = None
-    error_msg = None
-    final_status = "failed" # Default to failed unless successful
-
-    # --- Database access within the background task ---
-    with Session(engine) as db_session_for_task:
-        try:
-            # 1. Fetch and update job status to 'running'
-            job = db_session_for_task.get(AsyncJob, job_id)
-            if not job:
-                raise Exception(f"Job {job_id} not found in DB at start of task.")
-            if job.status != 'pending': # Avoid re-running completed/failed jobs
-                 print(f"Job {job_id} already started (status: {job.status}). Exiting task.")
-                 return
-
-            job.status = 'running'
-            job.progress = 0
-            job.updated_at = datetime.utcnow()
-            db_session_for_task.add(job)
-            db_session_for_task.commit()
-            db_session_for_task.refresh(job) # Refresh to ensure we have the latest state
-
-            # 2. Fetch associated PCAP session
-            pcap_session = db_session_for_task.get(PcapSession, session_id)
-            if not pcap_session:
-                raise Exception(f"PcapSession {session_id} not found in DB for job {job_id}")
-
-            print(f"Running extract_dicom_metadata_from_pcap for job {job_id}, session {session_id}")
-            # 3. Call the extraction function with DB progress and cancellation check callbacks
-            extracted_data = extract_dicom_metadata_from_pcap(
-                session_id=session_id,
-                progress_callback=update_progress_db,
-                check_stop_requested=check_stop_requested_db # Pass the DB check function
-            )
-
-            # 4. Update job status upon successful completion (if not cancelled)
-            # Check if stop was requested *after* the function returned but before setting status
-            if check_stop_requested_db():
-                 final_status = 'cancelled'
-                 error_msg = "Job cancelled by user after completion."
-                 print(f"DICOM extraction job {job_id} cancelled after completion.")
-            else:
-                 final_status = 'completed'
-                 print(f"DICOM extraction job {job_id} completed successfully.")
-
-        except JobCancelledException:
-            final_status = 'cancelled'
-            error_msg = "Job cancelled by user during execution."
-            print(f"DICOM extraction job {job_id} cancelled during execution.")
-        except FileNotFoundError as e:
-            error_msg = f"PCAP file not found: {str(e)}"
-            final_status = 'failed' # Ensure status is failed
-            print(f"DICOM extraction job {job_id} failed: {error_msg}")
-        except ImportError as e:
-            error_msg = f"Import error, DICOM extractor unavailable: {str(e)}"
-            final_status = 'failed' # Ensure status is failed
-            print(f"DICOM extraction job {job_id} failed: {error_msg}")
-        except Exception as e:
-            error_msg = str(e)
-            final_status = 'failed' # Ensure status is failed
-            print(f"DICOM extraction job {job_id} failed: {error_msg}")
-            traceback.print_exc() # Log the full traceback
-        finally:
-            print(f"--- TASK FINALLY BLOCK: DICOM Job {job_id}. Attempting final DB update. Status='{final_status}', Error='{error_msg}' ---")
-            # 5. Final DB update for status, result/error, and potentially reset stop_requested
-            try:
-                # Re-fetch job in case session expired or other issues
-                final_job_update = db_session_for_task.get(AsyncJob, job_id)
-                if final_job_update:
-                    print(f"    Found job {job_id} in DB for final update.")
-                    final_job_update.status = final_status
-                    final_job_update.error_message = error_msg
-                    # Store result only if completed successfully
-                    final_job_update.result_data = extracted_data if final_status == 'completed' else None
-                    # Set progress to 100 if completed, otherwise keep current progress
-                    final_job_update.progress = 100 if final_status == 'completed' else final_job_update.progress
-                    final_job_update.updated_at = datetime.utcnow()
-                    # Optionally reset stop_requested flag once job is finished (cancelled/failed/completed)
-                    # final_job_update.stop_requested = False
-                    db_session_for_task.add(final_job_update)
-                    db_session_for_task.commit()
-                    print(f"    SUCCESS: Final status for job {job_id} ({final_status}) saved to DB.") # Log success
-                else:
-                    print(f"    ERROR: Could not find job {job_id} for final status update.") # Log not found
-            except Exception as db_e:
-                 db_session_for_task.rollback()
-                 print(f"    CRITICAL ERROR: Failed to update final status for job {job_id} in DB: {db_e}") # Log DB error
-                 traceback.print_exc() # Log traceback for DB error
-
-    print(f"--- TASK END: DICOM Extraction Job {job_id} ---") # Added explicit end log
-
-
-# --- NEW Endpoint to Start DICOM Extraction Job ---
-@app.post("/sessions/{session_id}/dicom/extract/start", response_model=JobListResponse, tags=["DICOM", "Jobs"]) # Return job details
-async def start_dicom_extraction_job(
-    session_id: str,
-    background_tasks: BackgroundTasks,
-    db_session: Session = Depends(get_session)
-):
-    """Starts the DICOM metadata extraction process as a background task."""
-    # Verify session exists before starting the job
-    pcap_session = db_session.get(PcapSession, session_id)
-    if not pcap_session:
-        raise HTTPException(status_code=404, detail=f"Session with ID {session_id} not found.")
-
-    # Create AsyncJob record in DB, including the trace_name from the session
+    # Create the job, associating it with the input session ID
     new_job = AsyncJob(
-        session_id=session_id,
-        job_type='dicom_extract',
-        status='pending',
-        progress=0,
-        # Copy the user-provided session name as the trace_name for the job
-        trace_name=pcap_session.name,
-        created_at=datetime.utcnow(),
-        updated_at=datetime.utcnow()
+        session_id=session_id_from_frontend, # Job is associated with the input trace
+        trace_name=pcap_session_record.name, # User-facing name of the input trace
+        job_type="transform", status="pending", created_at=datetime.utcnow(), updated_at=datetime.utcnow(),
     )
     db_session.add(new_job)
     try:
-        db_session.commit()
-        db_session.refresh(new_job) # Get the auto-generated job ID
-        job_id = new_job.id
-        print(f"Created AsyncJob record {job_id} for DICOM extraction on session {session_id}")
+        db_session.commit(); db_session.refresh(new_job)
+        logger.info(f"Created AsyncJob {new_job.id} for IP/MAC anonymization of {pcap_session_record.name} ({session_id_from_frontend})/{input_pcap_filename}.")
     except Exception as e:
         db_session.rollback()
-        print(f"Failed to create AsyncJob record for DICOM extraction: {e}")
-        raise HTTPException(status_code=500, detail="Failed to initiate DICOM extraction job.")
+        logger.error(f"DB error creating AsyncJob for IP/MAC anonymization: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to create anonymization job.")
 
-    if job_id is None: # Should not happen if commit succeeded, but check anyway
-         raise HTTPException(status_code=500, detail="Failed to get job ID after creation.")
-
-    # --- Add logging before and after adding the task ---
-    print(f"Endpoint /dicom/extract/start: Attempting to add background task for job {job_id}...")
-    try:
-        # Add the DICOM extraction task to run in the background
-        background_tasks.add_task(run_dicom_extract, job_id, session_id)
-        print(f"Endpoint /dicom/extract/start: Successfully added background task for job {job_id}.")
-    except Exception as task_add_err:
-        # Log if adding the task itself fails
-        print(f"Endpoint /dicom/extract/start: CRITICAL ERROR adding background task for job {job_id}: {task_add_err}")
-        # Optionally update the job status to failed here if adding fails?
-        # For now, just log the error. The job will remain 'pending'.
-        # Consider raising an HTTPException if adding the task is critical failure
-        # raise HTTPException(status_code=500, detail=f"Failed to schedule background task: {task_add_err}")
-
-    # Return the created job details immediately
+    # Pass the input session ID directly to the background task
+    background_tasks.add_task(
+        run_apply_anonymization,
+        job_id=new_job.id,
+        input_session_id=session_id_from_frontend, # Pass the input session ID
+        input_pcap_filename=input_pcap_filename
+    )
     return new_job
 
+# --- MAC Anonymization Endpoints ---
 
-# --- Background Task Function for DICOM Extraction ---
-# Note: The duplicate definition of this function using the global 'jobs' dictionary has been removed.
-# The correct version using the database (AsyncJob) is defined earlier in the file.
-
-
-# --- NEW Endpoint to Start DICOM Extraction Job ---
-# Note: The duplicate definition of this endpoint using the global 'jobs' dictionary has been removed.
-# The correct version using the database (AsyncJob) is defined earlier in the file.
-
-
-# --- NEW Endpoint for Updating DICOM Metadata Overrides ---
-# This endpoint allows saving/updating DICOM metadata overrides.
-@app.put("/dicom/pcap/{session_id}/metadata/{ip_pair_key}", status_code=status.HTTP_204_NO_CONTENT, tags=["DICOM"])
-async def update_dicom_metadata_override(
-    session_id: str,
-    ip_pair_key: str, # e.g., "192.168.1.10-192.168.1.20"
-    payload: DicomMetadataUpdatePayload, # The metadata fields to update
-    db_session: Session = Depends(get_session) # Inject DB session
-):
+@app.get("/mac/vendors")
+async def get_mac_vendors_endpoint():
     """
-    Saves or updates DICOM metadata overrides for a specific IP pair within a session.
-    Stores the overrides in a JSON file named {session_id}_dicom_overrides.json.
+    Retrieves the MAC address vendor lookup data from the OUI CSV file.
     """
-    print(f"Request received to update DICOM metadata override for session: {session_id}, IP pair: {ip_pair_key}")
+    logger.info("Request received for GET /mac/vendors")
+    try:
+        # OUI_CSV_PATH is imported from MacAnonymizer as a string. Convert to Path object for .exists()
+        oui_csv_file_path_obj = Path(OUI_CSV_PATH)
 
-    # 1. Verify the session exists
-    pcap_session = db_session.get(PcapSession, session_id)
-    if not pcap_session:
-        print(f"Error: Session {session_id} not found in the database.")
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session with ID {session_id} not found."
-        )
-
-    # 2. Define the path for the overrides file
-    overrides_filename = f"{session_id}_dicom_overrides.json"
-    overrides_path = os.path.join(SESSION_DIR, overrides_filename)
-    print(f"Override file path: {overrides_path}")
-
-    # 3. Load existing overrides (if any)
-    overrides: Dict[str, Dict[str, Any]] = {}
-    if os.path.exists(overrides_path):
-        try:
-            with open(overrides_path, 'r') as f:
-                overrides = json.load(f)
-            print(f"Loaded existing overrides from {overrides_path}")
-        except json.JSONDecodeError:
-            print(f"Warning: Could not decode existing overrides file {overrides_path}. Starting fresh.")
-        except Exception as e:
-            print(f"Error reading overrides file {overrides_path}: {e}. Raising error.")
+        if not oui_csv_file_path_obj.exists():
+            logger.error(f"OUI CSV file not found at expected path: {oui_csv_file_path_obj}")
+            # Attempt to download it if missing? Or just return error?
+            # For now, return error. OUI update is a separate job.
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Could not read existing DICOM overrides file: {str(e)}"
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"OUI data file not found. Please run the OUI update process."
             )
 
-    # 4. Prepare the update data
-    # Use exclude_unset=True to only include fields explicitly sent by the client
-    update_data = payload.model_dump(exclude_unset=True)
-    if not update_data:
-         print("No update data provided in the payload.")
-         # Return 204 No Content even if nothing changed, as the request was valid
-         return Response(status_code=status.HTTP_204_NO_CONTENT)
+        # parse_oui_csv expects a string path, so we pass the original OUI_CSV_PATH (string)
+        vendor_data = parse_oui_csv(OUI_CSV_PATH) # Function from MacAnonymizer
+        if not vendor_data:
+             logger.warning(f"OUI CSV file at {oui_csv_file_path_obj} was parsed but resulted in empty data.")
+             # Return empty list if parsed data is empty
+             return []
 
-    print(f"Updating overrides for key '{ip_pair_key}' with data: {update_data}")
+        # Extract unique vendor names (values) and sort them
+        unique_vendor_names = sorted(list(set(vendor_data.values())))
 
-    # 5. Update the overrides dictionary
-    # If the key doesn't exist, create it. If it exists, update it.
-    if ip_pair_key not in overrides:
-        overrides[ip_pair_key] = {}
-
-    # Merge the new data into the existing entry for the IP pair key
-    # This overwrites existing values for the fields provided in the payload
-    overrides[ip_pair_key].update(update_data)
-
-    # 6. Save the updated overrides back to the JSON file
-    try:
-        with open(overrides_path, 'w') as f:
-            json.dump(overrides, f, indent=2) # Use indent for readability
-        print(f"Successfully saved updated overrides to {overrides_path}")
+        logger.info(f"Successfully parsed OUI data from {OUI_CSV_PATH}. Returning {len(unique_vendor_names)} unique vendor names.")
+        return unique_vendor_names # Return the sorted list of names
+    except FileNotFoundError: # Should be caught by the explicit check, but good fallback
+         raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"OUI data file not found. Please run the OUI update process."
+            )
     except Exception as e:
-        print(f"Error writing overrides file {overrides_path}: {e}")
+        logger.error(f"Error parsing OUI data file {OUI_CSV_PATH}: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Could not save DICOM overrides file: {str(e)}"
+            detail=f"Failed to load or parse MAC vendor data: {str(e)}"
         )
 
-    # 7. Return 204 No Content on success
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-
-# --- Background Task Function for PCAP Transformation ---
-def run_apply(job_id: int, session_id: str): # job_id is now int
-    """Background task function to perform PCAP anonymization/transformation and update DB, with cancellation support."""
-    print(f"Background task started for PCAP transformation job {job_id}, session {session_id}")
-
-    # Progress callback function to update the database
-    def update_progress_db(progress_percentage: int):
-        with Session(engine) as progress_session:
-            try:
-                job = progress_session.get(AsyncJob, job_id)
-                if job and job.status == 'running':
-                    job.progress = max(0, min(100, progress_percentage))
-                    job.updated_at = datetime.utcnow()
-                    progress_session.add(job)
-                    progress_session.commit()
-                    # print(f"Transform Job {job_id} progress: {progress_percentage}% (DB updated)")
-                elif job:
-                     print(f"Transform Job {job_id} no longer running (status: {job.status}), skipping progress update.")
-                else:
-                     print(f"Transform Job {job_id} not found during progress update.")
-            except Exception as e:
-                progress_session.rollback()
-                print(f"Error updating progress in DB for job {job_id}: {e}")
-            finally:
-                progress_session.close()
-
-    # --- Cancellation Check Function ---
-    def check_stop_requested_db() -> bool:
-        with Session(engine) as check_session:
-            try:
-                job = check_session.get(AsyncJob, job_id)
-                if job and job.stop_requested:
-                    print(f"--- TASK CHECK (Transform): Stop requested flag is TRUE for job {job_id} in DB ---")
-                    return True
-                return False
-            except Exception as e:
-                print(f"Error checking stop_requested flag in DB for transform job {job_id}: {e}")
-                return False
-            finally:
-                check_session.close()
-    # ---------------------------------
-
-    output_path = None
-    error_msg = None
-    final_status = "failed"
-
-    with Session(engine) as db_session_for_task:
-        try:
-            # 1. Fetch and update job status to 'running'
-            job = db_session_for_task.get(AsyncJob, job_id)
-            if not job:
-                raise Exception(f"Job {job_id} not found in DB at start of task.")
-            if job.status != 'pending':
-                 print(f"Job {job_id} already started (status: {job.status}). Exiting task.")
-                 return
-
-            job.status = 'running'
-            job.progress = 0
-            job.updated_at = datetime.utcnow()
-            db_session_for_task.add(job)
-            db_session_for_task.commit()
-            db_session_for_task.refresh(job)
-
-            # 2. Fetch associated PCAP session
-            original_pcap_session = db_session_for_task.get(PcapSession, session_id)
-            if not original_pcap_session:
-                raise Exception(f"Original PcapSession {session_id} not found in DB for job {job_id}")
-
-            # 3. Call the transformation function with progress and cancellation callbacks
-            print(f"Running apply_anonymization for job {job_id}, session {session_id}")
-            output_path = apply_anonymization(
-                session_id=session_id,
-                progress_callback=update_progress_db,
-                check_stop_requested=check_stop_requested_db # Pass the DB check function
+@app.get("/mac/vendors/{vendor_name}/oui", response_model=Dict[str, Optional[str]])
+async def get_oui_for_vendor_endpoint(vendor_name: str):
+    """
+    Retrieves the OUI for a specific vendor name.
+    Performs a case-insensitive search.
+    """
+    logger.info(f"Request received for GET /mac/vendors/{vendor_name}/oui")
+    try:
+        oui_csv_file_path_obj = Path(OUI_CSV_PATH)
+        if not oui_csv_file_path_obj.exists():
+            logger.error(f"OUI CSV file not found at {OUI_CSV_PATH} for OUI lookup.")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="OUI data file not found. Please update OUI list via settings."
             )
 
-            if not output_path or not os.path.exists(output_path):
-                 raise Exception(f"Anonymization completed but output file path '{output_path}' is invalid or missing.")
+        # oui_map is OUI_prefix -> Vendor Name
+        oui_map = parse_oui_csv(OUI_CSV_PATH)
+        if not oui_map:
+            logger.warning(f"OUI map parsed from {OUI_CSV_PATH} is empty for OUI lookup.")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"OUI data is empty or could not be parsed.")
 
-            # 4. Create a new PcapSession record for the transformed file
-            new_session_id = str(uuid.uuid4()) # Generate a new UUID for the transformed session
-            transformed_session = PcapSession(
-                id=new_session_id,
-                name=f"{original_pcap_session.name} (Transformed)", # Append suffix to name
-                description=f"Transformed from session {session_id} by job {job_id}",
-                original_filename=os.path.basename(output_path), # Use the new filename
-                upload_timestamp=datetime.utcnow(), # Timestamp of transformation completion
-                pcap_path=output_path, # Path to the *transformed* PCAP
-                rules_path=original_pcap_session.rules_path, # Copy rules path reference? Or null? Let's copy.
-                updated_at=datetime.utcnow(),
-                is_transformed=True,
-                original_session_id=session_id,
-                async_job_id=job_id
-            )
-            db_session_for_task.add(transformed_session)
-            print(f"Created new PcapSession {new_session_id} for transformed output of job {job_id}")
+        normalized_input_vendor = vendor_name.strip().upper()
+        
+        # Iterate through the OUI map to find the vendor (case-insensitive)
+        for oui_prefix, name_from_csv in oui_map.items():
+            if name_from_csv.strip().upper() == normalized_input_vendor:
+                logger.info(f"Found OUI '{oui_prefix}' for vendor '{vendor_name}' (normalized: '{normalized_input_vendor}')")
+                return {"oui": oui_prefix}
+        
+        logger.warning(f"OUI not found for vendor '{vendor_name}' (normalized: '{normalized_input_vendor}') after checking {len(oui_map)} entries.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"OUI not found for vendor '{vendor_name}'.")
 
-            # 5. Mark job as completed (if not cancelled)
-            if check_stop_requested_db():
-                 final_status = 'cancelled'
-                 error_msg = "Job cancelled by user after completion."
-                 print(f"PCAP transformation job {job_id} cancelled after completion.")
-                 # Clean up potentially created anon file if cancelled after creation
-                 if output_path and os.path.exists(output_path):
-                     try:
-                         os.remove(output_path)
-                         print(f"Cleaned up partially created anon file: {output_path}")
-                     except OSError as rm_err:
-                         print(f"Warning: Failed to clean up anon file {output_path} after cancellation: {rm_err}")
-            else:
-                 final_status = 'completed'
-                 print(f"PCAP transformation job {job_id} completed. Output: {output_path}")
+    except FileNotFoundError: # Should be caught by explicit check
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="OUI data file not found.")
+    except Exception as e:
+        logger.error(f"Error during OUI lookup for vendor '{vendor_name}': {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to lookup OUI for vendor '{vendor_name}': {str(e)}"
+        )
 
-        except AnonymizerJobCancelledException: # Catch the specific exception from anonymizer
-            final_status = 'cancelled'
-            error_msg = "Job cancelled by user during execution."
-            print(f"PCAP transformation job {job_id} cancelled during execution.")
-        except Exception as e:
-            error_msg = str(e)
-            final_status = 'failed' # Ensure status is failed
-            print(f"PCAP transformation job {job_id} failed: {error_msg}")
-            traceback.print_exc()
-        finally:
-            # 6. Final DB update for job status and error
-            try:
-                final_job_update = db_session_for_task.get(AsyncJob, job_id)
-                if final_job_update:
-                    final_job_update.status = final_status
-                    final_job_update.error_message = error_msg
-                    # No result_data for transform jobs
-                    final_job_update.progress = 100 if final_status == 'completed' else final_job_update.progress
-                    final_job_update.updated_at = datetime.utcnow()
-                    # Optionally reset stop_requested flag
-                    # final_job_update.stop_requested = False
-                    db_session_for_task.add(final_job_update)
-                    db_session_for_task.commit()
-                    print(f"Final status for job {job_id} ({final_status}) saved to DB.")
-                else:
-                     print(f"Could not find job {job_id} for final status update.")
-            except Exception as db_e:
-                 db_session_for_task.rollback()
-                 print(f"CRITICAL: Failed to update final status for job {job_id} in DB: {db_e}")
+@app.get("/mac/settings", response_model=MacSettings)
+async def get_mac_settings_endpoint(db_session: Session = Depends(get_session)):
+    # MAC settings are currently global, not per-session.
+    # This endpoint might need re-evaluation if settings become session-specific.
+    settings = load_mac_settings() # From MacAnonymizer.py (global settings file)
+    if not settings:
+        # Provide default settings if file doesn't exist or is invalid
+        logger.warning("MAC settings file not found or invalid, returning default.")
+        return MacSettings(csv_url="https://standards-oui.ieee.org/oui/oui.csv", last_updated=None)
+    return settings
 
+@app.put("/mac/settings", response_model=MacSettings)
+async def update_mac_settings_endpoint(update: MacSettingsUpdate, db_session: Session = Depends(get_session)):
+    # Global settings update
+    try:
+        updated_settings = save_mac_settings_global({"csv_url": update.csv_url}) # save_mac_settings_global from MacAnonymizer
+        return updated_settings
+    except Exception as e:
+        logger.error(f"Failed to update MAC settings: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to update MAC settings: {str(e)}")
 
-# --- NEW Endpoint to Start PCAP Transformation Job ---
-@app.post("/sessions/{session_id}/transform/start", response_model=JobListResponse, tags=["PCAP Anonymization", "Jobs"])
-async def start_transformation_job(
-    session_id: str,
+@app.post("/mac/update_oui_csv", response_model=AsyncJob)
+async def update_oui_csv_endpoint(
     background_tasks: BackgroundTasks,
     db_session: Session = Depends(get_session)
 ):
-    """Starts the PCAP transformation process as a background task."""
-    # Verify session exists before starting the job
-    pcap_session = db_session.get(PcapSession, session_id)
-    if not pcap_session:
-        raise HTTPException(status_code=404, detail=f"Session with ID {session_id} not found.")
-    if pcap_session.is_transformed:
-         raise HTTPException(status_code=400, detail="Cannot transform an already transformed session.")
+    # This job is global, not tied to a specific session_id for its operation,
+    # but we need a placeholder or a way to represent global jobs if AsyncJob.session_id is mandatory.
+    # For now, let's use a conceptual "global_mac_settings" as session_id for the job.
+    # This might need a dedicated field in AsyncJob or a convention.
+    # Rule 5: "AsyncJob.session_id field SHOULD store the actual_physical_directory_id"
+    # This doesn't directly apply here as it's not a trace-specific operation.
+    # Let's use a fixed dummy session_id for the job record for now.
+    # A better approach might be to allow nullable session_id for certain job_types.
+    global_mac_job_session_id = "global_mac_oui_update_job" # Conceptual ID
 
-    # Create AsyncJob record in DB
     new_job = AsyncJob(
-        session_id=session_id,
-        job_type='transform',
-        status='pending',
-        progress=0,
-        created_at=datetime.utcnow(),
-        updated_at=datetime.utcnow()
+        session_id=global_mac_job_session_id, # Placeholder
+        trace_name="OUI CSV Update",
+        job_type="mac_oui_update", status="pending", created_at=datetime.utcnow(), updated_at=datetime.utcnow()
     )
-    db_session.add(new_job)
-    try:
-        db_session.commit()
-        db_session.refresh(new_job)
-        job_id = new_job.id
-        print(f"Created AsyncJob record {job_id} for transformation on session {session_id}")
-    except Exception as e:
-        db_session.rollback()
-        print(f"Failed to create AsyncJob record for transformation: {e}")
-        raise HTTPException(status_code=500, detail="Failed to initiate transformation job.")
+    db_session.add(new_job); db_session.commit(); db_session.refresh(new_job)
+    logger.info(f"Created AsyncJob {new_job.id} for OUI CSV update.")
+    
+    async def run_update_oui_task(job_id: int): # Inner task for global operation
+        with Session(engine) as task_db_session:
+            job = task_db_session.get(AsyncJob, job_id)
+            if not job: return
+            job.status = "running"; task_db_session.commit()
+            try:
+                await download_oui_csv() # This function in MacAnonymizer updates the global file
+                job.status = "completed"; job.progress = 100
+            except Exception as e:
+                job.status = "failed"; job.error_message = str(e)
+                logger.error(f"OUI CSV update job {job.id} failed: {e}", exc_info=True)
+            finally:
+                job.updated_at = datetime.utcnow(); task_db_session.add(job); task_db_session.commit()
 
-    if job_id is None:
-         raise HTTPException(status_code=500, detail="Failed to get job ID after creation.")
-
-    print(f"Starting background task run_apply for job {job_id}")
-    background_tasks.add_task(run_apply, job_id, session_id)
-
-    # Return the created job details
+    background_tasks.add_task(run_update_oui_task, job_id=new_job.id)
     return new_job
 
+# Updated response_model to List[IpMacPair] (using the direct import)
+@app.get("/mac/ip-mac-pairs/{session_id_from_frontend}", response_model=List[IpMacPair])
+async def get_ip_mac_pairs_endpoint(
+    session_id_from_frontend: str,
+    db_session: Session = Depends(get_session), # Restored
+    pcap_filename: str = Query("capture.pcap", description="Logical filename of PCAP to analyze") # Restored
+):
+    logger.info(f"IP-MAC pairs request for session_id: {session_id_from_frontend}, file: {pcap_filename}") # Removed test route mention
+    try:
+        # Use the new helper function for validation
+        pcap_session_record, _ = await validate_session_and_file(
+            session_id=session_id_from_frontend,
+            pcap_filename=pcap_filename,
+            db_session=db_session
+        )
+    except HTTPException as e:
+        raise e # Propagate 404 or other validation errors
 
-# --- REMOVED Old /apply_async endpoint ---
-# Use /sessions/{session_id}/transform/start instead
+    logger.info(f"Validation successful for session {session_id_from_frontend}, file {pcap_filename}. Proceeding to extract pairs.")
+    try:
+        # Load the OUI map first
+        logger.debug(f"Attempting to load OUI map from: {OUI_CSV_PATH}")
+        oui_map: Dict[str, str] = {}
+        if os.path.exists(OUI_CSV_PATH):
+            try:
+                oui_map = parse_oui_csv(OUI_CSV_PATH) # Function from MacAnonymizer
+                if not oui_map:
+                    logger.warning(f"OUI map parsed from {OUI_CSV_PATH} is empty for IP-MAC pair extraction.")
+                else:
+                    logger.info(f"Loaded OUI map with {len(oui_map)} entries for IP-MAC pair extraction.")
+            except Exception as e_oui:
+                logger.warning(f"Failed to load or parse OUI map {OUI_CSV_PATH} for IP-MAC pair extraction: {e_oui}. Vendor info will be missing.")
+        else:
+            logger.warning(f"OUI CSV file not found at {OUI_CSV_PATH} for IP-MAC pair extraction. Vendor info will be missing.")
+
+        # Call extract_ip_mac_pairs (synchronous) with the loaded oui_map
+        logger.info(f"Calling extract_ip_mac_pairs for session {session_id_from_frontend}, file {pcap_filename}...")
+        pairs = extract_ip_mac_pairs(session_id_from_frontend, pcap_filename, oui_map) # From MacAnonymizer
+        logger.info(f"extract_ip_mac_pairs completed for session {session_id_from_frontend}. Found {len(pairs)} pairs.")
+        # Return the list directly
+        return pairs
+    except FileNotFoundError: # Should be caught by validate_session_and_file or storage.read_pcap_from_session
+        # Log the specific record name for better debugging if this unlikely case happens
+        session_name = pcap_session_record.name if 'pcap_session_record' in locals() else session_id_from_frontend
+        logger.error(f"File not found error during IP-MAC pair extraction for session '{session_name}'. This might indicate an issue after initial validation.")
+        raise HTTPException(status_code=404, detail=f"PCAP file '{pcap_filename}' could not be processed for session '{session_name}'.")
+    except Exception as e:
+        logger.error(f"Error extracting IP-MAC pairs: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to extract IP-MAC pairs: {str(e)}")
+
+@app.get("/mac/rules/{session_id_from_frontend}", response_model=List[MacRule])
+async def get_mac_rules_endpoint(
+    session_id_from_frontend: str,
+    db_session: Session = Depends(get_session)
+):
+    """
+    Retrieves the saved MAC anonymization rules for a specific session.
+    """
+    logger.info(f"Request received for GET /mac/rules/{session_id_from_frontend}")
+
+    # Validate the session exists (don't strictly need the record, but good practice)
+    pcap_session_record = db_session.get(PcapSession, session_id_from_frontend)
+    if not pcap_session_record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Session (trace) with ID '{session_id_from_frontend}' not found.")
+
+    mac_rules_filename = "mac_rules.json"
+    try:
+        # Load rules directly using storage.load_json
+        rules_data = storage.load_json(session_id_from_frontend, mac_rules_filename)
+
+        if rules_data is None:
+            # If file doesn't exist or is empty/invalid JSON, return empty list
+            logger.info(f"MAC rules file '{mac_rules_filename}' not found or empty for session {session_id_from_frontend}. Returning empty list.")
+            return []
+
+        # Validate the loaded data against the Pydantic model (List[MacRule])
+        # Pydantic will raise validation errors if the structure is wrong
+        validated_rules = [MacRule(**rule) for rule in rules_data]
+        logger.info(f"Successfully loaded and validated {len(validated_rules)} MAC rules for session {session_id_from_frontend}.")
+        return validated_rules
+
+    except json.JSONDecodeError as json_err:
+        logger.error(f"Error decoding JSON from '{mac_rules_filename}' for session {session_id_from_frontend}: {json_err}", exc_info=True)
+        # Return empty list or raise error? Let's return empty list for robustness.
+        return []
+    except Exception as e:
+        logger.error(f"Error loading MAC rules for session {session_id_from_frontend}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to load MAC rules: {str(e)}"
+        )
 
 
-# --- REMOVED Old /status/{job_id} endpoint ---
-# Replaced by /jobs/{job_id}
+@app.put("/mac/rules") # Assuming MacRuleInput contains session_id
+async def mac_rules_endpoint(input: MacRuleInput, db_session: Session = Depends(get_session)):
+    session_id = input.session_id # Use the ID directly
+    logger.info(f"Request to save MAC rules for session_id: {session_id}")
 
+    # Validate the session exists
+    pcap_session_record = db_session.get(PcapSession, session_id)
+    if not pcap_session_record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Session (trace) with ID '{session_id}' not found.")
 
-# --- Server-Sent Events (SSE) Endpoint for Job Status (Updated for DB) ---
+    # No need to resolve physical directory ID
+    mac_rules_filename = "mac_rules.json"
+    logger.info(f"MAC rules for session {session_id} will be saved in its directory as {mac_rules_filename}")
+    try:
+        # Frontend is now responsible for providing target_oui.
+        # Pydantic validation will ensure target_oui is present as it's mandatory in MacRule model.
+        rules_data = [r.model_dump() for r in input.rules]
+        storage.store_json(session_id, mac_rules_filename, rules_data)
+        
+        pcap_session_record.updated_at = datetime.utcnow()
+        db_session.add(pcap_session_record)
+        db_session.commit()
+        return {"message": "MAC rules saved successfully.", "session_id": session_id, "file": mac_rules_filename}
+    except Exception as e:
+        db_session.rollback()
+        logger.error(f"Error saving MAC rules for session {session_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to save MAC rules: {str(e)}")
 
-async def job_event_generator(job_id: int): # job_id is now int
-    """Asynchronous generator sending job status updates via SSE by polling the DB."""
-    # REMOVED: Global jobs dictionary access
-    last_status = None
-    last_progress = -1
-    last_error = None
-    last_result_data_summary = None # Track summary of result_data if needed
-    last_trace_name = None # Track trace name
+@app.post("/mac/apply", response_model=AsyncJob)
+async def apply_mac_transform_endpoint(
+    background_tasks: BackgroundTasks,
+    session_id_from_frontend: str = Form(..., alias="session_id"),
+    input_pcap_filename: str = Form(...),
+    db_session: Session = Depends(get_session)
+):
+    logger.info(f"Apply MAC transform request for session_id: {session_id_from_frontend}, file: {input_pcap_filename}")
+    try:
+        # Validate input session and file exist
+        pcap_session_record, _ = await validate_session_and_file(
+            session_id=session_id_from_frontend,
+            pcap_filename=input_pcap_filename,
+            db_session=db_session
+        )
+    except HTTPException as e:
+        raise e # Propagate 404 or other validation errors
 
-    print(f"SSE connection opened for job {job_id}")
+    # Load MAC rules directly from the input session's directory
+    mac_rules = storage.load_json(session_id_from_frontend, "mac_rules.json")
+    if mac_rules is None: # Could be empty list [] which is valid for "no rules"
+        logger.warning(f"MAC rules file not found or invalid in session {session_id_from_frontend} for MAC transform. Proceeding without specific rules (pass-through or default OUI).")
+        # Allow proceeding if rules are optional
+
+    # Create the job, associating it with the input session ID
+    new_job = AsyncJob(
+        session_id=session_id_from_frontend, # Job associated with the input trace
+        trace_name=pcap_session_record.name,
+        job_type="mac_transform", status="pending", created_at=datetime.utcnow(), updated_at=datetime.utcnow()
+    )
+    db_session.add(new_job); db_session.commit(); db_session.refresh(new_job)
+    logger.info(f"Created AsyncJob {new_job.id} for MAC transform of {pcap_session_record.name} ({session_id_from_frontend})/{input_pcap_filename}.")
+
+    # Pass the input session ID directly to the background task
+    background_tasks.add_task(
+        run_mac_transform,
+        job_id=new_job.id,
+        input_session_id=session_id_from_frontend, # Pass the input session ID
+        input_pcap_filename=input_pcap_filename
+    )
+    return new_job
+
+# --- DICOM Endpoints ---
+@app.post("/dicom/extract_metadata", response_model=AsyncJob)
+async def extract_dicom_metadata_endpoint(
+    background_tasks: BackgroundTasks,
+    session_id_from_frontend: str = Form(..., alias="session_id"),
+    input_pcap_filename: str = Form(...),
+    db_session: Session = Depends(get_session)
+):
+    logger.info(f"DICOM metadata extraction request for session_id: {session_id_from_frontend}, file: {input_pcap_filename}")
+    try:
+        # Validate input session and file exist
+        pcap_session_record, _ = await validate_session_and_file(
+            session_id=session_id_from_frontend,
+            pcap_filename=input_pcap_filename,
+            db_session=db_session
+        )
+    except HTTPException as e:
+        raise e # Propagate 404 or other validation errors
+
+    # Create the job, associating it with the input session ID
+    new_job = AsyncJob(
+        session_id=session_id_from_frontend, # Job associated with the input trace
+        trace_name=pcap_session_record.name,
+        job_type="dicom_extract", status="pending", created_at=datetime.utcnow(), updated_at=datetime.utcnow()
+    )
+    db_session.add(new_job); db_session.commit(); db_session.refresh(new_job)
+    logger.info(f"Created AsyncJob {new_job.id} for DICOM extraction from {pcap_session_record.name} ({session_id_from_frontend})/{input_pcap_filename}.")
+
+    # Pass the input session ID directly to the background task
+    background_tasks.add_task(
+        run_dicom_extract,
+        job_id=new_job.id,
+        input_session_id=session_id_from_frontend, # Pass the input session ID
+        input_pcap_filename=input_pcap_filename
+    )
+    return new_job
+
+@app.post("/dicom/anonymize_v2", response_model=AsyncJob)
+async def anonymize_dicom_v2_endpoint(
+    background_tasks: BackgroundTasks,
+    session_id_from_frontend: str = Form(..., alias="session_id"),
+    input_pcap_filename: str = Form(...),
+    metadata_overrides_json: Optional[str] = Form(None), # JSON string for overrides
+    db_session: Session = Depends(get_session)
+):
+    logger.info(f"DICOM Anonymize V2 request for session_id: {session_id_from_frontend}, file: {input_pcap_filename}")
+    try:
+        # Validate input session and file exist
+        pcap_session_record, _ = await validate_session_and_file(
+            session_id=session_id_from_frontend,
+            pcap_filename=input_pcap_filename,
+            db_session=db_session
+        )
+    except HTTPException as e:
+        raise e # Propagate 404 or other validation errors
+
+    # Overrides JSON string is passed directly to the task runner.
+    # The task runner will handle parsing it.
+
+    # Create the job, associating it with the input session ID
+    new_job = AsyncJob(
+        session_id=session_id_from_frontend, # Job associated with the input trace
+        trace_name=pcap_session_record.name,
+        job_type="dicom_anonymize_v2", status="pending", created_at=datetime.utcnow(), updated_at=datetime.utcnow()
+    )
+    db_session.add(new_job); db_session.commit(); db_session.refresh(new_job)
+    logger.info(f"Created AsyncJob {new_job.id} for DICOM Anonymize V2 of {pcap_session_record.name} ({session_id_from_frontend})/{input_pcap_filename}.")
+
+    # Pass the input session ID directly to the background task
+    background_tasks.add_task(
+        run_dicom_anonymize_v2,
+        job_id=new_job.id,
+        input_session_id=session_id_from_frontend, # Pass the input session ID
+        input_pcap_filename=input_pcap_filename,
+        metadata_overrides_json_string=metadata_overrides_json
+    )
+    return new_job
+
+DICOM_OVERRIDES_FILENAME = "dicom_metadata_overrides.json"
+
+@app.get("/dicom/metadata_overrides/{session_id_from_frontend}/{ip_pair_key}")
+async def get_dicom_metadata_overrides_endpoint(
+    session_id_from_frontend: str,
+    ip_pair_key: str, # e.g., "192.168.1.10-192.168.1.20"
+    db_session: Session = Depends(get_session)
+):
+    logger.info(f"Get DICOM metadata overrides for session {session_id_from_frontend}, IP pair {ip_pair_key}")
+    # Validate the session exists
+    pcap_session_record = db_session.get(PcapSession, session_id_from_frontend)
+    if not pcap_session_record:
+        raise HTTPException(status_code=404, detail=f"Session {session_id_from_frontend} not found.")
+
+    # Load overrides directly from the session's directory
+    all_overrides = storage.load_json(session_id_from_frontend, DICOM_OVERRIDES_FILENAME)
+    if all_overrides and ip_pair_key in all_overrides:
+        return all_overrides[ip_pair_key]
+    return {} # Return empty dict if no specific override for this key
+
+@app.put("/dicom/metadata_overrides/{session_id_from_frontend}/{ip_pair_key}")
+async def update_dicom_metadata_overrides_endpoint(
+    session_id_from_frontend: str,
+    ip_pair_key: str,
+    payload: DicomMetadataUpdatePayload,
+    db_session: Session = Depends(get_session)
+):
+    logger.info(f"Update DICOM metadata overrides for session {session_id_from_frontend}, IP pair {ip_pair_key}")
+
+    # Validate the session exists
+    pcap_session_record = db_session.get(PcapSession, session_id_from_frontend)
+    if not pcap_session_record:
+        raise HTTPException(status_code=404, detail=f"Session {session_id_from_frontend} not found.")
+
+    # Load and store overrides directly in the session's directory
+    all_overrides = storage.load_json(session_id_from_frontend, DICOM_OVERRIDES_FILENAME) or {}
+    all_overrides[ip_pair_key] = payload.model_dump(exclude_none=True) # Store only provided fields
+    storage.store_json(session_id_from_frontend, DICOM_OVERRIDES_FILENAME, all_overrides)
+
+    # Update timestamp of the session
+    pcap_session_record.updated_at = datetime.utcnow()
+    db_session.add(pcap_session_record)
+    db_session.commit()
+
+    return {"message": "DICOM metadata overrides updated successfully.", "ip_pair_key": ip_pair_key, "overrides": payload}
+
+# --- Job Management Endpoints ---
+@app.get("/jobs", response_model=List[JobListResponse])
+async def list_jobs(db_session: Session = Depends(get_session)):
+    statement = select(AsyncJob).order_by(AsyncJob.created_at.desc())
+    jobs = db_session.exec(statement).all()
+    return jobs
+
+@app.get("/jobs/{job_id}", response_model=JobStatusResponse)
+async def get_job_status(job_id: int, db_session: Session = Depends(get_session)):
+    job = db_session.get(AsyncJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+@app.post("/jobs/{job_id}/cancel", response_model=JobStatusResponse)
+async def cancel_job(job_id: int, db_session: Session = Depends(get_session)):
+    job = db_session.get(AsyncJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status not in ["pending", "running"]:
+        raise HTTPException(status_code=400, detail=f"Job in status '{job.status}' cannot be cancelled.")
+    job.status = "cancelling" # Signal to the task
+    job.stop_requested = True # More explicit flag
+    job.updated_at = datetime.utcnow()
+    db_session.add(job); db_session.commit(); db_session.refresh(job)
+    logger.info(f"Cancellation requested for job {job_id}.")
+    return job
+
+@app.delete("/jobs/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_job_record(job_id: int, db_session: Session = Depends(get_session)):
+    job = db_session.get(AsyncJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    # Optionally, add logic: only allow deletion of completed/failed/cancelled jobs
+    if job.status in ["running", "pending", "cancelling"]:
+        raise HTTPException(status_code=400, detail=f"Job in status '{job.status}' cannot be deleted. Please cancel or wait for completion.")
+    
+    # If the job produced an output trace, consider if that trace should also be deleted or unlinked.
+    # For now, just deleting the job record.
+    if job.output_trace_id:
+        logger.warning(f"Job {job_id} produced output trace {job.output_trace_id}. Deleting job record only. Trace remains.")
+
+    db_session.delete(job)
+    db_session.commit()
+    logger.info(f"AsyncJob record {job_id} deleted.")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+# --- SSE Job Status Endpoint ---
+async def job_status_event_generator(job_id: int, initial_job_status: JobStatusResponse, db: Session):
+    """
+    Asynchronously generates Server-Sent Events for job status updates.
+    Relies on polling the database for changes.
+    """
+    logger.info(f"SSE connection opened for job_id: {job_id}")
+    last_status_json = initial_job_status.model_dump_json()
+    yield f"data: {last_status_json}\n\n" # Send initial status immediately
+
     try:
         while True:
-            job_info: Optional[AsyncJob] = None
-            # Poll the database for the job status and session name
-            with Session(engine) as db_session:
-                job_info: Optional[AsyncJob] = None
-                trace_name: Optional[str] = None
-                try:
-                    # Fetch job info first
-                    job_info = db_session.get(AsyncJob, job_id)
-                    # If job exists, try fetching the associated session name
-                    if job_info:
-                        session = db_session.get(PcapSession, job_info.session_id)
-                        if session:
-                            trace_name = session.name
-                        else:
-                            print(f"SSE: Warning - PcapSession {job_info.session_id} not found for job {job_id}")
-                except Exception as e:
-                     print(f"SSE: Error fetching job/session info for job {job_id} from DB: {e}")
-                     # Send an error event to the client
-                     error_payload = json.dumps({"status": "error", "error": f"Database error fetching job: {e}", "job_id": job_id})
-                     yield f"data: {error_payload}\n\n"
-                     await asyncio.sleep(5) # Wait longer after DB error
-                     continue # Try fetching again
+            await asyncio.sleep(1) # Polling interval (e.g., 1 second)
+            
+            # Re-fetch job in each iteration to get the latest state
+            # This ensures that the db session is used in a way that's safe for long polling
+            current_job_from_db = db.get(AsyncJob, job_id)
+            if not current_job_from_db:
+                logger.warning(f"Job {job_id} not found during SSE polling. Closing stream.")
+                yield f"data: {{\"error\": \"Job not found\", \"job_id\": {job_id}}}\n\n"
+                break
 
-            # If job disappears from DB (e.g., deleted manually)
-            if not job_info:
-                error_payload = json.dumps({"status": "error", "error": "Job not found or deleted", "job_id": job_id})
-                yield f"data: {error_payload}\n\n" # Send error event
-                print(f"SSE closing for missing job {job_id}")
-                break # Stop generation
+            # Convert SQLModel instance to a dictionary before validation
+            job_dict = current_job_from_db.model_dump()
+            current_job_response = JobStatusResponse.model_validate(job_dict)
+            current_status_json = current_job_response.model_dump_json()
 
-            # Prepare payload based on JobStatusResponse model structure
-            current_status = job_info.status
-            current_progress = job_info.progress
-            current_error = job_info.error_message
-            # Summarize result_data if needed to avoid sending large JSON repeatedly
-            current_result_data_summary = str(job_info.result_data) if job_info.result_data else None
-            current_trace_name = trace_name # Use the fetched trace_name
+            if current_status_json != last_status_json:
+                last_status_json = current_status_json
+                logger.info(f"SSE: Job {job_id} status update: {last_status_json}")
+                yield f"data: {last_status_json}\n\n"
 
-            # Check if anything relevant changed (including trace_name)
-            if (current_status != last_status or
-                current_progress != last_progress or
-                current_error != last_error or
-                current_result_data_summary != last_result_data_summary or
-                current_trace_name != last_trace_name): # Check if trace name changed
-
-                payload_dict = {
-                    "id": job_info.id,
-                    "session_id": job_info.session_id,
-                    "trace_name": current_trace_name, # Include trace name in payload
-                    "job_type": job_info.job_type,
-                    "status": current_status,
-                    "progress": current_progress,
-                    "created_at": job_info.created_at.isoformat(), # Use ISO format for JSON
-                    "updated_at": job_info.updated_at.isoformat() if job_info.updated_at else None,
-                    "error_message": current_error,
-                    "result_data": job_info.result_data # Send full result data for now
-                }
-                current_payload = json.dumps(payload_dict)
-
-                yield f"data: {current_payload}\n\n" # SSE data format
-                print(f"SSE sent for job {job_id}: status={current_status}, progress={current_progress}%")
-
-                # Update last sent state
-                last_status = current_status
-                last_progress = current_progress
-                last_error = current_error
-                last_result_data_summary = current_result_data_summary
-                last_trace_name = current_trace_name # Update last trace name
-
-            # Stop sending events if job is finished (completed or failed)
-            if current_status in ['completed', 'failed']:
-                print(f"SSE stream closing for finished job {job_id} (status: {current_status})")
-                break # Stop generation
-
-            # Wait before checking status again
-            await asyncio.sleep(1) # Check every 1 second
-
+            if current_job_from_db.status in ["completed", "failed", "cancelled"]:
+                logger.info(f"SSE: Job {job_id} reached terminal state '{current_job_from_db.status}'. Closing stream.")
+                # Send final status one last time if it changed and led to termination
+                if current_status_json != last_status_json: # Ensure the very last update is sent
+                     yield f"data: {current_status_json}\n\n"
+                break
     except asyncio.CancelledError:
-         print(f"SSE connection for job {job_id} closed by client.")
+        logger.info(f"SSE connection for job_id: {job_id} closed by client.")
+        # Do not reraise CancelledError if you want the generator to exit cleanly
+        # FastAPI/Starlette will handle the client disconnect.
     except Exception as e:
-         print(f"SSE generator error for job {job_id}: {e}")
-         traceback.print_exc()
-         # Attempt to send a final error message
-         try:
-             error_payload = json.dumps({"status": "error", "error": f"SSE generator error: {e}", "job_id": job_id})
-             yield f"data: {error_payload}\n\n"
-         except Exception:
-             pass # Ignore errors during final error reporting
+        logger.error(f"SSE error for job_id {job_id}: {e}", exc_info=True)
+        try:
+            # Attempt to send an error message to the client
+            error_payload = {"error": "SSE stream encountered an internal error", "job_id": job_id}
+            yield f"data: {json.dumps(error_payload)}\n\n"
+        except Exception as send_err:
+            logger.error(f"SSE: Failed to send error to client for job {job_id}: {send_err}")
     finally:
-         print(f"SSE event generation stopped for job {job_id}.")
+        logger.info(f"SSE stream ended for job_id: {job_id}")
 
 
-@app.get("/jobs/{job_id}/events", tags=["Jobs"]) # Updated path
-async def stream_job_status(job_id: int): # job_id is now int
-    """Endpoint for clients (frontend) to subscribe to job status updates via SSE for any job type."""
-    # Check if job exists when client first connects (optional, generator handles it too)
-    with Session(engine) as db_session:
-        job_exists = db_session.get(AsyncJob, job_id) is not None
-    if not job_exists:
-         raise HTTPException(status_code=404, detail=f"Job ID {job_id} not found at time of connection")
+@app.get("/jobs/{job_id}/events", response_class=StreamingResponse)
+async def job_events_sse(job_id: int, db_session: Session = Depends(get_session)):
+    job_orm = db_session.get(AsyncJob, job_id) # Renamed to job_orm
+    if not job_orm:
+        # Return a plain JSON response for the 404, not a stream
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"detail": "Job not found"}
+        )
+    
+    # Convert SQLModel instance to a dictionary before validation
+    job_dict = job_orm.model_dump()
+    initial_job_status = JobStatusResponse.model_validate(job_dict)
+    
+    # Pass the db_session to the generator. The generator should use this session.
+    # FastAPI handles the lifecycle of db_session for the request.
+    return StreamingResponse(job_status_event_generator(job_id, initial_job_status, db_session), media_type="text/event-stream")
 
-    # Return a StreamingResponse using the event generator
-    return StreamingResponse(job_event_generator(job_id), media_type="text/event-stream")
 
-# --- Main Execution (for development) ---
+# --- Download Endpoint ---
+@app.get("/download/{session_id_from_frontend}/{filename}")
+async def download_session_file_endpoint( # Renamed function
+    session_id_from_frontend: str,
+    filename: str, # This is the logical filename the user wants to download
+    db_session: Session = Depends(get_session)
+):
+    logger.info(f"Download request for session {session_id_from_frontend}, filename {filename}")
+    try:
+        # Use the new helper function for validation
+        _, validated_file_path = await validate_session_and_file(
+            session_id=session_id_from_frontend,
+            pcap_filename=filename, # The logical filename is used here
+            db_session=db_session
+        )
+    except HTTPException as e:
+        # Propagate 404 or other validation errors
+        raise e
+
+    # The helper already confirmed the file exists
+    logger.info(f"Serving file: {validated_file_path} with requested filename: {filename}")
+
+    # Determine media type based on filename extension
+    media_type = "application/octet-stream" # Default
+    if filename.lower().endswith(".pcap"):
+        media_type = "application/vnd.tcpdump.pcap"
+    elif filename.lower().endswith(".json"):
+        media_type = "application/json"
+    # Add more types here if needed (e.g., .txt, .csv)
+    # elif filename.lower().endswith(".txt"):
+    #     media_type = "text/plain"
+    # elif filename.lower().endswith(".csv"):
+    #     media_type = "text/csv"
+
+    logger.info(f"Determined media type: {media_type} for filename: {filename}")
+
+    return FileResponse(path=validated_file_path, filename=filename, media_type=media_type)
+
+# --- Settings Management Endpoints ---
+@app.post("/api/v1/settings/clear-all-data", status_code=status.HTTP_200_OK)
+async def clear_all_data_endpoint(
+    background_tasks: BackgroundTasks, # Moved before db_session
+    db_session: Session = Depends(get_session)
+):
+    logger.info("Request received for POST /api/v1/settings/clear-all-data")
+
+    error_messages = []
+
+    # 1. Delete all AsyncJob records
+    try:
+        statement_jobs = select(AsyncJob)
+        jobs_to_delete = db_session.exec(statement_jobs).all()
+        num_jobs_deleted = len(jobs_to_delete)
+        for job in jobs_to_delete:
+            db_session.delete(job)
+        db_session.commit()
+        logger.info(f"Successfully deleted {num_jobs_deleted} AsyncJob records.")
+    except Exception as e:
+        db_session.rollback()
+        msg = f"Error deleting AsyncJob records: {str(e)}"
+        logger.error(msg, exc_info=True)
+        error_messages.append(msg)
+
+    # 2. Delete all PcapSession records
+    try:
+        statement_sessions = select(PcapSession)
+        sessions_to_delete = db_session.exec(statement_sessions).all()
+        num_sessions_deleted = len(sessions_to_delete)
+        for session_record in sessions_to_delete:
+            db_session.delete(session_record)
+        db_session.commit()
+        logger.info(f"Successfully deleted {num_sessions_deleted} PcapSession records.")
+    except Exception as e:
+        db_session.rollback()
+        msg = f"Error deleting PcapSession records: {str(e)}"
+        logger.error(msg, exc_info=True)
+        error_messages.append(msg)
+
+    # 3. Delete all physical session directories
+    deleted_dirs_count = 0
+    failed_dirs_count = 0
+    try:
+        sessions_base_dir = storage.SESSIONS_BASE_DIR # Corrected to use the constant
+        if sessions_base_dir.exists() and sessions_base_dir.is_dir():
+            for session_dir_item in sessions_base_dir.iterdir():
+                if session_dir_item.is_dir(): # Ensure it's a directory
+                    try:
+                        shutil.rmtree(session_dir_item)
+                        logger.info(f"Successfully deleted session directory: {session_dir_item}")
+                        deleted_dirs_count += 1
+                    except Exception as e:
+                        msg = f"Failed to delete session directory {session_dir_item}: {str(e)}"
+                        logger.error(msg, exc_info=True)
+                        error_messages.append(msg)
+                        failed_dirs_count += 1
+        logger.info(f"Physical directory cleanup: {deleted_dirs_count} deleted, {failed_dirs_count} failed.")
+    except Exception as e:
+        msg = f"Error accessing or iterating session directories at {storage.SESSIONS_BASE_DIR}: {str(e)}" # Corrected here as well
+        logger.error(msg, exc_info=True)
+        error_messages.append(msg)
+
+    if error_messages:
+        # If there were any errors, return a 500 status but include details
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "message": "Completed clearing data with some errors.",
+                "details": error_messages,
+                "jobs_deleted": num_jobs_deleted if 'num_jobs_deleted' in locals() else 0,
+                "sessions_deleted_db": num_sessions_deleted if 'num_sessions_deleted' in locals() else 0,
+                "directories_deleted_fs": deleted_dirs_count,
+                "directories_failed_fs": failed_dirs_count
+            }
+        )
+
+    return {
+        "message": "All data cleared successfully.",
+        "jobs_deleted": num_jobs_deleted if 'num_jobs_deleted' in locals() else 0,
+        "sessions_deleted_db": num_sessions_deleted if 'num_sessions_deleted' in locals() else 0,
+        "directories_deleted_fs": deleted_dirs_count
+    }
+
+# --- Main block for direct execution (optional, for development) ---
 if __name__ == "__main__":
     import uvicorn
-    print("Starting Uvicorn server for development...")
-    # Run the FastAPI app using Uvicorn server
-    # reload=True automatically restarts server on code changes
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    # This allows running the app with `python backend/main.py`
+    # create_db_and_tables() # Ensure tables are created if running directly (also done in lifespan)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
