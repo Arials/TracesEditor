@@ -40,10 +40,11 @@ from fastapi.responses import (
     JSONResponse,  # Added JSONResponse
     StreamingResponse,
 )
+from fastapi.routing import APIRouter # Added for organizing routes
 from sqlmodel import Session, SQLModel, select  # Ensure select is imported
 
 # --- Database Imports ---
-from database import AsyncJob, PcapSession, create_db_and_tables, engine, get_session  # Added AsyncJob, engine
+from backend.database import AsyncJob, PcapSession, create_db_and_tables, engine, get_session  # Added AsyncJob, engine
 
 # --- Storage Import ---
 from backend import storage  # Import the refactored storage module
@@ -72,7 +73,7 @@ logger.info("Successfully imported functions from backend.anonymizer")
 
 
 # --- DICOM V2 Anonymizer Import ---
-from DicomAnonymizer import anonymize_dicom_v2, extract_dicom_metadata # Assuming this is in project root or PYTHONPATH
+from backend.DicomAnonymizer import anonymize_dicom_v2, extract_dicom_metadata # Assuming this is in project root or PYTHONPATH
 
 # --- DICOM PCAP Extractor Import ---
 from backend.dicom_pcap_extractor import extract_dicom_metadata_from_pcap
@@ -82,7 +83,7 @@ logger.info("Successfully imported extract_dicom_metadata_from_pcap from backend
 
 # --- Pydantic Models ---
 from pydantic import BaseModel, Field
-from models import (
+from backend.models import (
     AggregatedDicomResponse,
     DicomMetadataUpdatePayload,
     IpMacPair, # Import IpMacPair directly
@@ -94,6 +95,19 @@ from models import (
     PcapSessionResponse,
     RuleInput,
 )
+
+# --- DICOM PCAP Generation Imports ---
+from backend.protocols.dicom.models import DicomPcapRequestPayload, Scene # Added Scene
+from backend.protocols.dicom.scene_processor import DicomSceneProcessor, DicomSceneProcessorError # New import
+from backend.protocols.dicom.utils import (
+    create_associate_rq_pdu,
+    create_associate_ac_pdu,
+    create_dicom_dataset,
+    create_p_data_tf_pdu,
+)
+from backend.protocols.dicom.handler import generate_dicom_session_packet_list
+from scapy.all import PacketList # Ensure PacketList is imported
+
 
 # --- MAC Anonymizer Imports ---
 from backend.MacAnonymizer import (
@@ -229,17 +243,211 @@ async def lifespan(app: FastAPI):
 # --- FastAPI Application ---
 app = FastAPI(lifespan=lifespan)
 
+# --- CORS Middleware Configuration ---
+# Define the origins allowed to make requests to your backend.
+# Replace "http://localhost:5173" with the actual URL of your frontend if it's different.
+origins = [
+    "http://localhost:5173",  # Common for Vite dev server
+    "http://127.0.0.1:5173", # Also common
+    # Add any other origins if your frontend might be served from them
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=origins,       # List of allowed origins
+    allow_credentials=True,      # Allow cookies to be included in requests
+    allow_methods=["*"],         # Allow all methods (GET, POST, PUT, DELETE, OPTIONS, etc.)
+    allow_headers=["*"],         # Allow all headers
 )
+# --- End CORS Middleware Configuration ---
 
-# --- API Endpoints ---
 
-@app.post("/upload", response_model=PcapSession)
+# --- Routers ---
+# General router for existing endpoints
+general_router = APIRouter()
+# Router for DICOM protocol specific endpoints
+dicom_router = APIRouter(prefix="/protocols/dicom", tags=["dicom"])
+
+
+# --- DICOM Protocol Endpoints ---
+@dicom_router.post("/generate-pcap", response_class=FileResponse)
+async def generate_dicom_pcap_endpoint(
+    payload: DicomPcapRequestPayload,
+    db_session: Session = Depends(get_session) # Keep db_session if storage needs it, though not directly used here
+):
+    logger.info(f"Received request to generate DICOM PCAP with payload: {payload.model_dump_json(indent=2)}")
+
+    try:
+        # 1. Create A-ASSOCIATE-RQ PDU
+        assoc_rq_pdu_bytes = create_associate_rq_pdu(
+            calling_ae_title=payload.association_request.calling_ae_title,
+            called_ae_title=payload.association_request.called_ae_title,
+            application_context_name=payload.association_request.application_context_name,
+            presentation_contexts_input=[pc.model_dump() for pc in payload.association_request.presentation_contexts]
+        )
+        logger.info(f"A-ASSOCIATE-RQ PDU created, length: {len(assoc_rq_pdu_bytes)} bytes")
+
+        # 2. Simulate A-ASSOCIATE-AC PDU (assuming acceptance of all proposed contexts)
+        presentation_context_results = []
+        for pc_rq in payload.association_request.presentation_contexts:
+            # Assuming the first proposed transfer syntax is accepted
+            accepted_transfer_syntax = pc_rq.transfer_syntaxes[0] if pc_rq.transfer_syntaxes else "1.2.840.10008.1.2" # Default Implicit VR LE
+            presentation_context_results.append({
+                "id": pc_rq.id,
+                "result": 0, # Acceptance
+                "transfer_syntax": accepted_transfer_syntax
+            })
+        
+        assoc_ac_pdu_bytes = create_associate_ac_pdu(
+            calling_ae_title=payload.association_request.calling_ae_title, # From original RQ
+            called_ae_title=payload.association_request.called_ae_title,   # Responding as this AE
+            application_context_name=payload.association_request.application_context_name,
+            presentation_contexts_results_input=presentation_context_results
+        )
+        logger.info(f"A-ASSOCIATE-AC PDU created, length: {len(assoc_ac_pdu_bytes)} bytes")
+
+        # 3. Create P-DATA-TF PDUs for each DICOM message
+        p_data_tf_pdu_bytes_list = []
+        for msg_item in payload.dicom_messages:
+            # Command Set
+            cmd_dataset = create_dicom_dataset(msg_item.command_set.to_pydicom_dict())
+            cmd_dataset.is_little_endian = True
+            cmd_dataset.is_implicit_VR = True
+            # Add MessageType to command dataset if not already present (pydicom might do this, but explicit is safer)
+            # For C-STORE-RQ, AffectedSOPClassUID is (0000,0002), Priority (0000,0700), MessageID (0000,0110)
+            # CommandField (0000,0100) is 1 for RQ, DataSetType (0000,0800)
+            # pydicom's dimse_extended_negotiation and other high-level functions handle this.
+            # For manual creation, ensure all necessary command fields are set.
+            # For C-STORE-RQ, CommandField is 0x0001. DataSetType is 0x0000 if no dataset, 0x0101 if dataset follows.
+            # For C-ECHO-RQ, CommandField is 0x0030. DataSetType is 0x0101 (no data set).
+            
+            # Simplified: pydicom's create_dataset_from_elements will add some tags if they are standard
+            # For now, relying on the input JSON to provide necessary command elements.
+            # The `create_p_data_tf_pdu` handles `is_command` flag.
+
+            p_data_cmd_pdu_bytes = create_p_data_tf_pdu(
+                dimse_dataset=cmd_dataset,
+                presentation_context_id=msg_item.presentation_context_id,
+                is_command=True
+            )
+            p_data_tf_pdu_bytes_list.append(p_data_cmd_pdu_bytes)
+            logger.info(f"P-DATA-TF (Command: {msg_item.message_type}) PDU created, length: {len(p_data_cmd_pdu_bytes)} bytes")
+
+            if msg_item.data_set:
+                data_dataset = create_dicom_dataset(msg_item.data_set.to_pydicom_dict())
+                data_dataset.is_little_endian = True
+                data_dataset.is_implicit_VR = True
+                p_data_data_pdu_bytes = create_p_data_tf_pdu(
+                    dimse_dataset=data_dataset,
+                    presentation_context_id=msg_item.presentation_context_id,
+                    is_command=False
+                )
+                p_data_tf_pdu_bytes_list.append(p_data_data_pdu_bytes)
+                logger.info(f"P-DATA-TF (Data for {msg_item.message_type}) PDU created, length: {len(p_data_data_pdu_bytes)} bytes")
+
+        # 4. Generate Scapy PacketList
+        network_params_dict = payload.connection_details.model_dump()
+        scapy_packet_list = generate_dicom_session_packet_list(
+            network_params=network_params_dict,
+            associate_rq_pdu_bytes=assoc_rq_pdu_bytes,
+            associate_ac_pdu_bytes=assoc_ac_pdu_bytes,
+            p_data_tf_pdu_list=p_data_tf_pdu_bytes_list
+            # client_isn and server_isn will use defaults from handler
+        )
+        logger.info(f"Scapy PacketList generated with {len(scapy_packet_list)} packets.")
+
+        # 5. Store PCAP using storage module
+        # For this test endpoint, we generate a unique ID but don't create a PcapSession DB record.
+        temp_trace_id = f"temp_dicom_gen_{uuid.uuid4().hex[:8]}"
+        output_pcap_filename = f"generated_dicom_{temp_trace_id}.pcap"
+        
+        # Ensure the base sessions directory exists (storage.py might not do this)
+        # storage.SESSIONS_BASE_DIR.mkdir(parents=True, exist_ok=True) # storage.write_pcap_to_session should handle this.
+
+        pcap_file_path: Path = storage.write_pcap_to_session(
+            session_id=temp_trace_id,
+            filename=output_pcap_filename,
+            packets=scapy_packet_list
+        )
+        logger.info(f"PCAP file successfully written to: {pcap_file_path}")
+
+        # 6. Return FileResponse
+        return FileResponse(
+            path=str(pcap_file_path),
+            media_type="application/vnd.tcpdump.pcap",
+            filename=output_pcap_filename, # Filename for the download
+            # Add headers to suggest deletion after download if it's truly temporary
+            # headers={"Content-Disposition": f"attachment; filename=\"{output_pcap_filename}\""}
+        )
+
+    except HTTPException as e:
+        logger.error(f"HTTPException during DICOM PCAP generation: {e.detail}", exc_info=True)
+        raise e
+    except Exception as e:
+        logger.error(f"Unexpected error during DICOM PCAP generation: {str(e)}", exc_info=True)
+        # traceback.print_exc() # For more detailed console logging during debug
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate DICOM PCAP: {str(e)}"
+        )
+
+@dicom_router.post("/v2/generate-pcap-from-scene", response_class=FileResponse)
+async def generate_pcap_from_scene_endpoint(
+    scene_payload: Scene,
+    # db_session: Session = Depends(get_session) # Not creating persistent records for this type of generation
+):
+    logger.info(f"Received request for /v2/protocols/dicom/generate-pcap-from-scene for scene: {scene_payload.scene_id}")
+    try:
+        processor = DicomSceneProcessor(scene=scene_payload) # Uses default asset_templates_base_path
+        
+        scapy_packet_list: PacketList = processor.process_scene()
+        
+        if not scapy_packet_list:
+            logger.warning(f"Scene processing for scene '{scene_payload.scene_id}' resulted in an empty packet list.")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Scene processing resulted in no packets. Please check scene definition."
+            )
+
+        logger.info(f"Scene '{scene_payload.scene_id}' processed successfully. Generated {len(scapy_packet_list)} packets.")
+
+        temp_trace_id = f"scene_gen_{uuid.uuid4().hex[:12]}"
+        # Sanitize scene_id for filename, take first 16 chars, replace non-alphanum with underscore
+        safe_scene_id_part = "".join(c if c.isalnum() else "_" for c in scene_payload.scene_id[:16])
+        output_pcap_filename = f"scene_{safe_scene_id_part}_{temp_trace_id[:8]}.pcap"
+
+        pcap_file_path: Path = storage.write_pcap_to_session(
+            session_id=temp_trace_id, # This creates a temporary session directory
+            filename=output_pcap_filename,
+            packets=scapy_packet_list
+        )
+        logger.info(f"Temporary PCAP file for scene '{scene_payload.scene_id}' written to: {pcap_file_path}")
+
+        return FileResponse(
+            path=str(pcap_file_path),
+            media_type="application/vnd.tcpdump.pcap",
+            filename=output_pcap_filename,
+        )
+
+    except DicomSceneProcessorError as e:
+        logger.error(f"Error during DICOM scene processing for scene '{scene_payload.scene_id}': {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Error processing DICOM scene: {str(e)}"
+        )
+    except HTTPException as e: # Re-raise known HTTPExceptions
+        raise e
+    except Exception as e:
+        logger.error(f"Unexpected error during scene-based DICOM PCAP generation for scene '{scene_payload.scene_id}': {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate PCAP from scene: {str(e)}"
+        )
+
+
+# --- General API Endpoints (moved to general_router) ---
+
+@general_router.post("/upload", response_model=PcapSession)
 async def upload(
     name: str = Form(...),
     file: UploadFile = File(...),
@@ -284,7 +492,7 @@ async def upload(
         logger.warning(f"Warning: Failed to create initial empty rules file for {session_id}: {e}")
     return db_pcap_session
 
-@app.get("/sessions", response_model=List[PcapSessionResponse])
+@general_router.get("/sessions", response_model=List[PcapSessionResponse])
 async def list_sessions_endpoint(db_session: Session = Depends(get_session)): # Renamed for clarity
     logger.info("Request received for GET /sessions")
     all_pcap_responses: List[PcapSessionResponse] = []
@@ -340,7 +548,7 @@ async def list_sessions_endpoint(db_session: Session = Depends(get_session)): # 
         logger.exception("Exception detail during /sessions fetch:")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve file list: {e}")
 
-@app.put("/sessions/{session_id}", response_model=PcapSession)
+@general_router.put("/sessions/{session_id}", response_model=PcapSession)
 async def update_session(
     session_id: str, session_update: PcapSessionUpdate, db_session: Session = Depends(get_session)
 ):
@@ -370,7 +578,7 @@ async def update_session(
             raise HTTPException(status_code=500, detail=f"Failed to update session metadata: {e}")
     return db_pcap_session
 
-@app.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+@general_router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_session(session_id: str, db_session: Session = Depends(get_session)):
     logger.info(f"Request received for DELETE /sessions/{session_id}")
     pcap_session = db_session.get(PcapSession, session_id)
@@ -727,8 +935,8 @@ async def run_dicom_anonymize_v2(
             job.updated_at = datetime.utcnow(); db_session.add(job); db_session.commit()
 
 
-# --- IP/MAC Anonymization Endpoints ---
-@app.get("/subnets/{session_id_from_frontend}")
+# --- IP/MAC Anonymization Endpoints (moved to general_router) ---
+@general_router.get("/subnets/{session_id_from_frontend}")
 async def get_subnets_endpoint(
     session_id_from_frontend: str,
     db_session: Session = Depends(get_session),
@@ -757,7 +965,7 @@ async def get_subnets_endpoint(
         logger.error(f"Error extracting subnets: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to extract subnets: {e}")
 
-@app.put("/rules")
+@general_router.put("/rules")
 async def rules_endpoint(input: RuleInput, db_session: Session = Depends(get_session)):
     session_id = input.session_id # Use the ID directly
     logger.info(f"Request received for PUT /rules for session_id: {session_id}")
@@ -784,7 +992,7 @@ async def rules_endpoint(input: RuleInput, db_session: Session = Depends(get_ses
         logger.error(f"Error saving rules for session {session_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to save subnet rules: {e}")
 
-@app.get("/preview/{session_id_from_frontend}")
+@general_router.get("/preview/{session_id_from_frontend}")
 async def preview_endpoint(
     session_id_from_frontend: str,
     pcap_filename: Optional[str] = Query("capture.pcap", description="Logical filename of PCAP to preview"),
@@ -813,7 +1021,7 @@ async def preview_endpoint(
         logger.error(f"Error generating preview: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to generate preview: {e}")
 
-@app.post("/apply", response_model=AsyncJob)
+@general_router.post("/apply", response_model=AsyncJob)
 async def apply_endpoint(
     background_tasks: BackgroundTasks, 
     session_id_from_frontend: str = Form(..., alias="session_id"),
@@ -860,9 +1068,9 @@ async def apply_endpoint(
     )
     return new_job
 
-# --- MAC Anonymization Endpoints ---
+# --- MAC Anonymization Endpoints (moved to general_router) ---
 
-@app.get("/mac/vendors")
+@general_router.get("/mac/vendors")
 async def get_mac_vendors_endpoint():
     """
     Retrieves the MAC address vendor lookup data from the OUI CSV file.
@@ -905,7 +1113,7 @@ async def get_mac_vendors_endpoint():
             detail=f"Failed to load or parse MAC vendor data: {str(e)}"
         )
 
-@app.get("/mac/vendors/{vendor_name}/oui", response_model=Dict[str, Optional[str]])
+@general_router.get("/mac/vendors/{vendor_name}/oui", response_model=Dict[str, Optional[str]])
 async def get_oui_for_vendor_endpoint(vendor_name: str):
     """
     Retrieves the OUI for a specific vendor name.
@@ -947,7 +1155,7 @@ async def get_oui_for_vendor_endpoint(vendor_name: str):
             detail=f"Failed to lookup OUI for vendor '{vendor_name}': {str(e)}"
         )
 
-@app.get("/mac/settings", response_model=MacSettings)
+@general_router.get("/mac/settings", response_model=MacSettings)
 async def get_mac_settings_endpoint(db_session: Session = Depends(get_session)):
     # MAC settings are currently global, not per-session.
     # This endpoint might need re-evaluation if settings become session-specific.
@@ -958,7 +1166,7 @@ async def get_mac_settings_endpoint(db_session: Session = Depends(get_session)):
         return MacSettings(csv_url="https://standards-oui.ieee.org/oui/oui.csv", last_updated=None)
     return settings
 
-@app.put("/mac/settings", response_model=MacSettings)
+@general_router.put("/mac/settings", response_model=MacSettings)
 async def update_mac_settings_endpoint(update: MacSettingsUpdate, db_session: Session = Depends(get_session)):
     # Global settings update
     try:
@@ -968,7 +1176,7 @@ async def update_mac_settings_endpoint(update: MacSettingsUpdate, db_session: Se
         logger.error(f"Failed to update MAC settings: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to update MAC settings: {str(e)}")
 
-@app.post("/mac/update_oui_csv", response_model=AsyncJob)
+@general_router.post("/mac/update_oui_csv", response_model=AsyncJob)
 async def update_oui_csv_endpoint(
     background_tasks: BackgroundTasks,
     db_session: Session = Depends(get_session)
@@ -1009,7 +1217,7 @@ async def update_oui_csv_endpoint(
     return new_job
 
 # Updated response_model to List[IpMacPair] (using the direct import)
-@app.get("/mac/ip-mac-pairs/{session_id_from_frontend}", response_model=List[IpMacPair])
+@general_router.get("/mac/ip-mac-pairs/{session_id_from_frontend}", response_model=List[IpMacPair])
 async def get_ip_mac_pairs_endpoint(
     session_id_from_frontend: str,
     db_session: Session = Depends(get_session), # Restored
@@ -1058,7 +1266,7 @@ async def get_ip_mac_pairs_endpoint(
         logger.error(f"Error extracting IP-MAC pairs: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to extract IP-MAC pairs: {str(e)}")
 
-@app.get("/mac/rules/{session_id_from_frontend}", response_model=List[MacRule])
+@general_router.get("/mac/rules/{session_id_from_frontend}", response_model=List[MacRule])
 async def get_mac_rules_endpoint(
     session_id_from_frontend: str,
     db_session: Session = Depends(get_session)
@@ -1101,7 +1309,7 @@ async def get_mac_rules_endpoint(
         )
 
 
-@app.put("/mac/rules") # Assuming MacRuleInput contains session_id
+@general_router.put("/mac/rules") # Assuming MacRuleInput contains session_id
 async def mac_rules_endpoint(input: MacRuleInput, db_session: Session = Depends(get_session)):
     session_id = input.session_id # Use the ID directly
     logger.info(f"Request to save MAC rules for session_id: {session_id}")
@@ -1129,7 +1337,7 @@ async def mac_rules_endpoint(input: MacRuleInput, db_session: Session = Depends(
         logger.error(f"Error saving MAC rules for session {session_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to save MAC rules: {str(e)}")
 
-@app.post("/mac/apply", response_model=AsyncJob)
+@general_router.post("/mac/apply", response_model=AsyncJob)
 async def apply_mac_transform_endpoint(
     background_tasks: BackgroundTasks,
     session_id_from_frontend: str = Form(..., alias="session_id"),
@@ -1171,8 +1379,8 @@ async def apply_mac_transform_endpoint(
     )
     return new_job
 
-# --- DICOM Endpoints ---
-@app.post("/dicom/extract_metadata", response_model=AsyncJob)
+# --- DICOM Endpoints (moved to general_router, except the new one which is in dicom_router) ---
+@general_router.post("/dicom/extract_metadata", response_model=AsyncJob)
 async def extract_dicom_metadata_endpoint(
     background_tasks: BackgroundTasks,
     session_id_from_frontend: str = Form(..., alias="session_id"),
@@ -1208,7 +1416,7 @@ async def extract_dicom_metadata_endpoint(
     )
     return new_job
 
-@app.post("/dicom/anonymize_v2", response_model=AsyncJob)
+@general_router.post("/dicom/anonymize_v2", response_model=AsyncJob)
 async def anonymize_dicom_v2_endpoint(
     background_tasks: BackgroundTasks,
     session_id_from_frontend: str = Form(..., alias="session_id"),
@@ -1249,9 +1457,9 @@ async def anonymize_dicom_v2_endpoint(
     )
     return new_job
 
-DICOM_OVERRIDES_FILENAME = "dicom_metadata_overrides.json"
+DICOM_OVERRIDES_FILENAME = "dicom_metadata_overrides.json" # This can remain global if filename is standard
 
-@app.get("/dicom/metadata_overrides/{session_id_from_frontend}/{ip_pair_key}")
+@general_router.get("/dicom/metadata_overrides/{session_id_from_frontend}/{ip_pair_key}")
 async def get_dicom_metadata_overrides_endpoint(
     session_id_from_frontend: str,
     ip_pair_key: str, # e.g., "192.168.1.10-192.168.1.20"
@@ -1269,7 +1477,7 @@ async def get_dicom_metadata_overrides_endpoint(
         return all_overrides[ip_pair_key]
     return {} # Return empty dict if no specific override for this key
 
-@app.put("/dicom/metadata_overrides/{session_id_from_frontend}/{ip_pair_key}")
+@general_router.put("/dicom/metadata_overrides/{session_id_from_frontend}/{ip_pair_key}")
 async def update_dicom_metadata_overrides_endpoint(
     session_id_from_frontend: str,
     ip_pair_key: str,
@@ -1295,21 +1503,21 @@ async def update_dicom_metadata_overrides_endpoint(
 
     return {"message": "DICOM metadata overrides updated successfully.", "ip_pair_key": ip_pair_key, "overrides": payload}
 
-# --- Job Management Endpoints ---
-@app.get("/jobs", response_model=List[JobListResponse])
+# --- Job Management Endpoints (moved to general_router) ---
+@general_router.get("/jobs", response_model=List[JobListResponse])
 async def list_jobs(db_session: Session = Depends(get_session)):
     statement = select(AsyncJob).order_by(AsyncJob.created_at.desc())
     jobs = db_session.exec(statement).all()
     return jobs
 
-@app.get("/jobs/{job_id}", response_model=JobStatusResponse)
+@general_router.get("/jobs/{job_id}", response_model=JobStatusResponse)
 async def get_job_status(job_id: int, db_session: Session = Depends(get_session)):
     job = db_session.get(AsyncJob, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
 
-@app.post("/jobs/{job_id}/cancel", response_model=JobStatusResponse)
+@general_router.post("/jobs/{job_id}/cancel", response_model=JobStatusResponse)
 async def cancel_job(job_id: int, db_session: Session = Depends(get_session)):
     job = db_session.get(AsyncJob, job_id)
     if not job:
@@ -1323,7 +1531,7 @@ async def cancel_job(job_id: int, db_session: Session = Depends(get_session)):
     logger.info(f"Cancellation requested for job {job_id}.")
     return job
 
-@app.delete("/jobs/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
+@general_router.delete("/jobs/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_job_record(job_id: int, db_session: Session = Depends(get_session)):
     job = db_session.get(AsyncJob, job_id)
     if not job:
@@ -1396,7 +1604,7 @@ async def job_status_event_generator(job_id: int, initial_job_status: JobStatusR
         logger.info(f"SSE stream ended for job_id: {job_id}")
 
 
-@app.get("/jobs/{job_id}/events", response_class=StreamingResponse)
+@general_router.get("/jobs/{job_id}/events", response_class=StreamingResponse)
 async def job_events_sse(job_id: int, db_session: Session = Depends(get_session)):
     job_orm = db_session.get(AsyncJob, job_id) # Renamed to job_orm
     if not job_orm:
@@ -1415,8 +1623,8 @@ async def job_events_sse(job_id: int, db_session: Session = Depends(get_session)
     return StreamingResponse(job_status_event_generator(job_id, initial_job_status, db_session), media_type="text/event-stream")
 
 
-# --- Download Endpoint ---
-@app.get("/download/{session_id_from_frontend}/{filename}")
+# --- Download Endpoint (moved to general_router) ---
+@general_router.get("/download/{session_id_from_frontend}/{filename}")
 async def download_session_file_endpoint( # Renamed function
     session_id_from_frontend: str,
     filename: str, # This is the logical filename the user wants to download
@@ -1453,8 +1661,8 @@ async def download_session_file_endpoint( # Renamed function
 
     return FileResponse(path=validated_file_path, filename=filename, media_type=media_type)
 
-# --- Settings Management Endpoints ---
-@app.post("/api/v1/settings/clear-all-data", status_code=status.HTTP_200_OK)
+# --- Settings Management Endpoints (moved to general_router) ---
+@general_router.post("/api/v1/settings/clear-all-data", status_code=status.HTTP_200_OK)
 async def clear_all_data_endpoint(
     background_tasks: BackgroundTasks, # Moved before db_session
     db_session: Session = Depends(get_session)
@@ -1543,3 +1751,7 @@ if __name__ == "__main__":
     # This allows running the app with `python backend/main.py`
     # create_db_and_tables() # Ensure tables are created if running directly (also done in lifespan)
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+# Include the routers in the main app
+app.include_router(general_router)
+app.include_router(dicom_router)

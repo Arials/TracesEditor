@@ -5,7 +5,10 @@ python-magic
 pydantic
 cidr-trie
 pytest
+pytest-mock
 python-multipart
 sqlmodel
-pydicom
+pydicom>=2.0.0
 requests
+pynetdicom
+httpx

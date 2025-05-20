@@ -1,0 +1,51 @@
+#,Manufacturer,Model Family,Model,Device Type
+1,GE HealthCare,Revolution™ CT Series 23,Apex,Computed Tomography (CT)
+2,Siemens Healthineers,SOMATOM Series 33,Force,Computed Tomography (CT)
+3,Philips Healthcare,Incisive CT / Spectral CT Series 34,Incisive CT 7500,Computed Tomography (CT)
+4,Canon Medical Systems,Aquilion Series 35,Prime SP,Computed Tomography (CT)
+5,GE HealthCare,SIGNA™ MRI Series 37,Artist,Magnetic Resonance Imaging (MRI)
+6,Siemens Healthineers,MAGNETOM Series 38,Vida,Magnetic Resonance Imaging (MRI)
+7,Philips Healthcare,Ingenia Series 39,Elition 3.0T X,Magnetic Resonance Imaging (MRI)
+8,Canon Medical Systems,Vantage MRI Series 40,Orian 1.5T,Magnetic Resonance Imaging (MRI)
+9,GE HealthCare,Definium Series 47,AMX 700,Digital Radiography (DR)
+10,Siemens Healthineers,Ysio Series 48,Ysio Max,Digital Radiography (DR)
+11,Carestream Health,DRX Series 49,Evolution Plus,Digital Radiography (DR)
+12,Fujifilm,FDR Series 51,D-EVO III,Digital Radiography (DR)
+13,Philips Healthcare,DigitalDiagnost Series 52,C90,Digital Radiography (DR)
+14,Hologic,Selenia Dimensions Series 56,9000,Mammography (MG) - Tomosynthesis
+15,GE HealthCare,Senographe Pristina™ (3D) 57,Pristina,Mammography (MG) - Tomosynthesis
+16,Siemens Healthineers,MAMMOMAT Revelation (3D) 58,Revelation,Mammography (MG) - Tomosynthesis
+17,Fujifilm,ASPIRE Cristalle 59,FDR MS-3500,Mammography (MG) - Tomosynthesis
+18,GE HealthCare,LOGIQ Series 66,E10,"Ultrasound (US) - General Imaging"
+19,GE HealthCare,Voluson Series 66,Expert 22,"Ultrasound (US) - Women's Health"
+20,GE HealthCare,Vivid Series 66,E95,"Ultrasound (US) - Cardiovascular"
+21,Philips Healthcare,EPIQ Series 72,CVx,"Ultrasound (US) - Premium General/Cardio"
+22,Philips Healthcare,Affiniti Series 72,70,"Ultrasound (US) - General/Cardio"
+23,Siemens Healthineers,ACUSON Sequoia 73,Sequoia,"Ultrasound (US) - Premium General"
+24,Siemens Healthineers,ACUSON Redwood 73,Redwood,"Ultrasound (US) - General Imaging"
+25,Canon Medical Systems,Aplio i-Series / Prism Edition 74,i800,"Ultrasound (US) - Premium General"
+26,"Samsung (Boston Imaging)","HERA / RS85 Series 16","W10 / Prestige","Ultrasound (US) - Women's Health/General"
+27,"Mindray","Resona / DC Series 16","R9 / DC-80","Ultrasound (US) - General Imaging"
+28,GE HealthCare,Discovery PET/CT Series 76,MI,PET/CT
+29,GE HealthCare,Omni Legend PET/CT 76,"Omni Legend 32",PET/CT
+30,Siemens Healthineers,Biograph PET/CT Series 77,Vision,PET/CT
+31,Philips Healthcare,Vereos Digital PET/CT 78,Vereos,PET/CT
+32,Canon Medical Systems,Cartesion Prime PET/CT 79,"PCD-1000A/3",PET/CT
+33,"Varian (Siemens Healthineers)","TrueBeam 29",TrueBeam,Radiotherapy (Linear Accelerator)
+34,"Varian (Siemens Healthineers)","Halcyon 29",Halcyon,Radiotherapy (Linear Accelerator)
+35,"Varian (Siemens Healthineers)","Ethos Therapy 29",Ethos,Radiotherapy (Adaptive Linac)
+36,Elekta,"Versa HD™ 89","Versa HD",Radiotherapy (Linear Accelerator)
+37,Elekta,"Elekta Harmony 89",Harmony,Radiotherapy (Linear Accelerator)
+38,Elekta,"Elekta Unity MR-Linac 89",Unity,Radiotherapy (MR-Guided Linac)
+39,Accuray,"Radixact® System 24","Radixact (with ClearRT™/Synchrony®)",Radiotherapy (Helical Tomotherapy)
+40,Accuray,"CyberKnife® System 24","S7™",Radiotherapy (Robotic Radiosurgery)
+41,Sectra,"Sectra PACS 21","Sectra PACS",PACS (Picture Archiving and Communication System)
+42,Agfa HealthCare,"Enterprise Imaging Platform 94","Enterprise Imaging","PACS / VNA / Universal Viewer"
+43,Fujifilm,"Synapse VNA 22","Synapse VNA",VNA (Vendor Neutral Archive)
+44,Fujifilm,"Synapse PACS 22","Synapse PACS",PACS
+45,"Merative (formerly IBM Watson Health)","Merge PACS / VNA / Universal Viewer 21","Merge PACS","PACS / VNA / Universal Viewer"
+46,GE HealthCare,"Centricity PACS / Universal Viewer 21","Centricity PACS","PACS / Universal Viewer"
+47,"Change Healthcare (Optum)","Radiology Solutions PACS 21","Radiology Solutions",PACS
+48,"Nuance (Microsoft)","PowerShare™ Network 99","PowerShare™ Network","Image Exchange / Cloud Network"
+49,"Visage Imaging (Pro Medicus)","Visage 7 Enterprise Imaging Platform 21","Visage 7","Enterprise Imaging Platform / Viewer"
+50,Carestream Health,"Vue PACS / Vue Archive 22","Vue PACS","PACS / Archive"

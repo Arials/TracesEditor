@@ -1,0 +1,25 @@
+{
+  "template_id": "TEMPLATE_GENERIC_PACS_V1",
+  "template_name": "Generic PACS Server",
+  "template_description": "A general-purpose PACS server template. Typically acts as SCP for various storage SOP classes, Verification, Query/Retrieve, and Storage Commitment.",
+  "dicom_properties": {
+    "ae_title": "PACS_GENERIC_AE",
+    "implementation_class_uid": "1.2.826.0.1.3680043.2.1143.107.104.103.1",
+    "implementation_version_name": "ArchiveServ_G_20",
+    "manufacturer": "Generic Archive Solutions",
+    "model_name": "PACSStore 5000",
+    "software_versions": ["OS:ServerOS_v3", "App:PACSApp_v2.5"],
+    "device_serial_number": null,
+    "supported_sop_classes": [
+      { "sop_class_uid": "1.2.840.10008.1.1", "role": "SCP", "transfer_syntaxes": ["1.2.840.10008.1.2"]},
+      { "sop_class_uid": "1.2.840.10008.5.1.4.1.1.1", "role": "SCP", "transfer_syntaxes": ["1.2.840.10008.1.2.1", "1.2.840.10008.1.2.4.50", "1.2.840.10008.1.2"]},
+      { "sop_class_uid": "1.2.840.10008.5.1.4.1.1.2", "role": "SCP", "transfer_syntaxes": ["1.2.840.10008.1.2.1", "1.2.840.10008.1.2.4.50", "1.2.840.10008.1.2"]},
+      { "sop_class_uid": "1.2.840.10008.5.1.4.1.1.4", "role": "SCP", "transfer_syntaxes": ["1.2.840.10008.1.2.1", "1.2.840.10008.1.2.4.50", "1.2.840.10008.1.2"]},
+      { "sop_class_uid": "1.2.840.10008.5.1.4.1.1.7", "role": "SCP", "transfer_syntaxes": ["1.2.840.10008.1.2.1", "1.2.840.10008.1.2.4.50", "1.2.840.10008.1.2"]},
+      { "sop_class_uid": "1.2.840.10008.5.1.4.1.1.12.1", "role": "SCP", "transfer_syntaxes": ["1.2.840.10008.1.2.1", "1.2.840.10008.1.2.4.50", "1.2.840.10008.1.2"]},
+      { "sop_class_uid": "1.2.840.10008.5.1.4.1.2.2.1", "role": "SCP", "transfer_syntaxes": ["1.2.840.10008.1.2.1", "1.2.840.10008.1.2"]},
+      { "sop_class_uid": "1.2.840.10008.5.1.4.1.2.2.2", "role": "SCP", "transfer_syntaxes": ["1.2.840.10008.1.2.1", "1.2.840.10008.1.2"]},
+      { "sop_class_uid": "1.2.840.10008.1.20.1", "role": "SCP", "transfer_syntaxes": ["1.2.840.10008.1.2.1", "1.2.840.10008.1.2"]}
+    ]
+  }
+}

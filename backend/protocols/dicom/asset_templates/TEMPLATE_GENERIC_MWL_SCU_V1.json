@@ -1,0 +1,26 @@
+{
+  "template_id": "TEMPLATE_GENERIC_MWL_SCU_V1",
+  "template_name": "Generic Modality Worklist SCU",
+  "template_description": "A generic workstation that primarily acts as an SCU for Modality Worklist.",
+  "dicom_properties": {
+    "ae_title": "WKSTN_GENERIC_AE",
+    "implementation_class_uid": "1.2.826.0.1.3680043.2.1143.107.104.103.2",
+    "implementation_version_name": "WkstApp_Gen_3.0",
+    "manufacturer": "Generic Imaging Systems",
+    "model_name": "Workstation Pro",
+    "software_versions": ["OS:WinGeneric", "App:MWLClient_v3.1"],
+    "device_serial_number": null,
+    "supported_sop_classes": [
+      {
+        "sop_class_uid": "1.2.840.10008.1.1",
+        "role": "BOTH",
+        "transfer_syntaxes": ["1.2.840.10008.1.2"]
+      },
+      {
+        "sop_class_uid": "1.2.840.10008.5.1.4.1.2.1.1",
+        "role": "SCU",
+        "transfer_syntaxes": ["1.2.840.10008.1.2.1", "1.2.840.10008.1.2"]
+      }
+    ]
+  }
+}
